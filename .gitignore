@@ -1,0 +1,12 @@
+# macOS
+.DS_Store
+
+# Node / Expo for mobile app
+mobile/node_modules/
+mobile/.expo/
+mobile/dist/
+
+# Logs
+mobile/npm-debug.log*
+mobile/yarn-debug.log*
+mobile/yarn-error.log*
