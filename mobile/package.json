@@ -6,11 +6,14 @@
     "start": "expo start",
     "android": "expo start --android",
     "ios": "expo start --ios",
-    "web": "expo start --web"
+    "web": "expo start --web",
+    "seed:today": "node scripts/seed-firestore.mjs --date=$(node -e \"console.log(new Date().toISOString().slice(0,10))\")",
+    "seed": "node scripts/seed-firestore.mjs",
+    "seed:global": "node scripts/seed-global-recipes.mjs"
   },
   "dependencies": {
     "expo": "~54.0.13",
-    "expo-ads-admob": "^13.0.0",
+    "expo-ads-admob": "^8.4.0",
     "expo-status-bar": "~3.0.8",
     "firebase": "^12.4.0",
     "react": "19.1.0",

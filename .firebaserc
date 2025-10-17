@@ -1,0 +1,8 @@
+{
+  "projects": {
+    "default": "wordcraft-36438",
+    "staging": "wordcraft-36438"
+  },
+  "targets": {},
+  "etags": {}
+}

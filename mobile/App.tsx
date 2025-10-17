@@ -1,66 +1,94 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { SafeAreaView, View, Text, StyleSheet, TouchableOpacity, FlatList, Alert, PanResponder, LayoutRectangle, Animated, Platform, useWindowDimensions, ScrollView, TextInput, useColorScheme } from 'react-native';
-import { AdMobBanner } from 'expo-ads-admob';
+// import { AdMobBanner } from 'expo-ads-admob'; // Disabled for web compatibility
+import { fetchPuzzleForDate, fetchGlobalRecipes, requestAIRecipe } from './firebase';
 
 type WordItem = { id: string; name: string; type?: 'start' | 'goal' | 'result' };
 
 function getTodayISO(): string {
-  return new Date().toISOString().slice(0, 10);
+  const d = new Date();
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`; // Local date (device time)
+}
+
+function getEpochISO(): string {
+  // Fixed global epoch: start from 2025-01-01 so that #1 = 2025-01-01
+  return '2025-01-01';
 }
 
 function getDailyNumber(): number {
-  const start = new Date('2022-01-01T00:00:00Z').getTime();
-  const today = new Date();
-  const utcMidnight = Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate());
-  const diffDays = Math.floor((utcMidnight - start) / (1000 * 60 * 60 * 24));
-  return diffDays + 1; // start at #1
+  // Count calendar days between epoch and today using UTC to avoid DST skew
+  const epochISO = getEpochISO();
+  const [ey, em, ed] = epochISO.split('-').map(n => parseInt(n, 10));
+  const epochUTC = Date.UTC(ey, em - 1, ed, 0, 0, 0, 0);
+  const now = new Date();
+  const todayUTC = Date.UTC(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0, 0);
+  const diffDays = Math.floor((todayUTC - epochUTC) / 86400000);
+  return diffDays + 1;
 }
 
-function seededRandom(seedStr: string) {
-  let seed = 0;
-  for (let i = 0; i < seedStr.length; i++) seed = (seed * 31 + seedStr.charCodeAt(i)) >>> 0;
-  return () => (seed = (1103515245 * seed + 12345) % 2 ** 31) / 2 ** 31;
+// Use mulberry32 to match server-side scripts
+function mulberry32(seed: number) {
+  return function() {
+    let t = (seed = (seed + 0x6D2B79F5) >>> 0) >>> 0;
+    t = Math.imul(t ^ (t >>> 15), t | 1) >>> 0;
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
 }
 
-const WORDS: WordItem[] = [
-  { id: 'water', name: 'Water', type: 'start' },
-  { id: 'fire', name: 'Fire', type: 'start' },
-  { id: 'earth', name: 'Earth', type: 'start' },
-  { id: 'air', name: 'Air', type: 'start' },
-  { id: 'electricity', name: 'Electricity', type: 'goal' },
-  { id: 'energy', name: 'Energy', type: 'result' },
-  { id: 'steam', name: 'Steam', type: 'result' },
-  { id: 'mud', name: 'Mud', type: 'result' },
-  { id: 'plant', name: 'Plant', type: 'result' },
+function seedFromDateStr(dateStr: string) {
+  let seed = 0 >>> 0;
+  for (let i = 0; i < dateStr.length; i++) {
+    seed = Math.imul(seed, 31) + dateStr.charCodeAt(i);
+    seed >>>= 0;
+  }
+  return seed >>> 0;
+}
+
+// Deterministic daily pools (no Firebase puzzles)
+const START_WORD_NAMES = [
+  'Water','Fire','Earth','Air','Light','Dark','Heat','Cold',
+  'Stone','Wood','Metal','Sand','Ice','Steam','Smoke','Dust'
+];
+const GOAL_WORD_NAMES = [
+  'Electricity','Life','Time','Space','Energy','Matter','Light',
+  'Sound','Color','Music','Art','Love','Hope','Dream','Magic',
+  'Power','Wisdom','Peace','Freedom','Justice','Beauty','Truth'
 ];
 
-const RECIPES: Record<string, WordItem> = {
-  'air+earth': { id: 'dust', name: 'Dust', type: 'result' },
-  'air+fire': { id: 'energy', name: 'Energy', type: 'result' },
-  'air+water': { id: 'rain', name: 'Rain', type: 'result' },
-  'earth+fire': { id: 'lava', name: 'Lava', type: 'result' },
-  'earth+water': { id: 'mud', name: 'Mud', type: 'result' },
-  'fire+water': { id: 'steam', name: 'Steam', type: 'result' },
-  'earth+rain': { id: 'plant', name: 'Plant', type: 'result' },
-};
+// Local RECIPES removed - now using global recipes from Firestore
 
 function stableKey(a: string, b: string): string {
   const [x, y] = [a.toLowerCase(), b.toLowerCase()].sort();
   return `${x}+${y}`;
 }
 
-function slugify(text: string): string {
+function slugify(text: string | null | undefined): string {
+  if (!text) return '';
   return text.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
 }
 
+function toItem(name: string, type: WordItem['type']): WordItem {
+  const id = name.toLowerCase().replace(/[^a-z0-9]+/g, '-');
+  return { id, name, type };
+}
+
 function pickDaily(dateISO: string) {
-  const rnd = seededRandom(dateISO);
-  const starts = WORDS.filter(w => w.type === 'start');
-  const goals = WORDS.filter(w => w.type === 'goal');
-  const pick = (arr: WordItem[]) => arr[Math.floor(rnd() * arr.length)];
-  const s1 = pick(starts), s2 = pick(starts);
-  const goal = pick(goals);
-  return { goal, startWords: [s1, s2] };
+  const rnd = mulberry32(seedFromDateStr(dateISO));
+  const pickName = (arr: string[]) => arr[Math.floor(rnd() * arr.length)];
+  const goalName = pickName(GOAL_WORD_NAMES);
+  const k = rnd() < 0.5 ? 2 : 3;
+  const pool = [...START_WORD_NAMES];
+  const starts: string[] = [];
+  for (let i = 0; i < k; i++) {
+    const idx = Math.floor(rnd() * pool.length);
+    starts.push(pool[idx]);
+    pool.splice(idx, 1);
+  }
+  return { goal: toItem(goalName, 'goal'), startWords: starts.map(n => toItem(n, 'start')) };
 }
 
 type Placed = { uid: number; id: string; name: string; type?: WordItem['type']; x: number; y: number; z: number };
@@ -74,13 +102,28 @@ export default function App() {
   const isDark = effectiveScheme !== 'light';
 
   const [dateISO, setDateISO] = useState(getTodayISO());
-  const daily = useMemo(() => pickDaily(dateISO), [dateISO]);
-  const [discovered, setDiscovered] = useState<WordItem[]>(daily.startWords);
+  const [dailyOverride, setDailyOverride] = useState<{ goal: WordItem; startWords: WordItem[] } | null>(null);
+  const [recipesOverride, setRecipesOverride] = useState<Record<string, WordItem> | null>(null);
+  const [forceReload, setForceReload] = useState(0); // Force reload counter
+  const [isLoading, setIsLoading] = useState(true); // Loading state
+  const [isCombining, setIsCombining] = useState(false); // Combining state
+  const daily = useMemo(() => dailyOverride ?? pickDaily(dateISO), [dailyOverride, dateISO]);
+  const [discovered, setDiscovered] = useState<WordItem[]>([]);
   const [placed, setPlaced] = useState<Placed[]>([]);
   const nextUidRef = useRef(1);
   const [zCounter, setZCounter] = useState(1);
   const canvasRef = useRef<View>(null);
   const canvasRect = useRef<LayoutRectangle | null>(null);
+
+  // Update discovered when daily changes
+  useEffect(() => {
+    // Remove duplicates by id
+    const uniqueWords = daily.startWords.filter((word, index, self) => 
+      index === self.findIndex(w => w.id === word.id)
+    );
+    setDiscovered(uniqueWords);
+    setPlaced([]); // Clear placed items when daily changes
+  }, [daily]);
 
   // drag ghost state
   const dragItemRef = useRef<WordItem | null>(null);
@@ -127,8 +170,15 @@ export default function App() {
   const filteredAll = useMemo(() => {
     const byLetter = invFilter ? discovered.filter(d => (d.name || d.id).toLowerCase().startsWith(invFilter.toLowerCase())) : discovered;
     const bySearch = searchQuery.trim().toLowerCase();
-    if (!bySearch) return byLetter;
-    return byLetter.filter(d => (d.name || d.id).toLowerCase().includes(bySearch));
+    let result = byLetter;
+    if (bySearch) {
+      result = byLetter.filter(d => (d.name || d.id).toLowerCase().includes(bySearch));
+    }
+    
+    // Remove duplicates by id
+    return result.filter((item, index, self) => 
+      index === self.findIndex(i => i.id === item.id)
+    );
   }, [discovered, invFilter, searchQuery]);
   const favoriteItems = useMemo(() => filteredAll.filter(d => favorites.includes(d.id)), [filteredAll, favorites]);
   const nonFavoriteItems = useMemo(() => filteredAll.filter(d => !favorites.includes(d.id)), [filteredAll, favorites]);
@@ -142,17 +192,30 @@ export default function App() {
   type TabKey = 'all' | 'recent';
   const [activeTab, setActiveTab] = useState<TabKey>('all');
   const tabItems = useMemo(() => {
+    let items: WordItem[] = [];
+    
     if (activeTab === 'recent') {
-      return filteredAll.filter(d => recent.includes(d.id)).sort((a, b) => recent.indexOf(a.id) - recent.indexOf(b.id));
+      items = filteredAll.filter(d => recent.includes(d.id)).sort((a, b) => recent.indexOf(a.id) - recent.indexOf(b.id));
+    } else {
+      // When letter filter or search is active, show only filteredAll
+      const hasLetterFilter = !!invFilter;
+      const hasSearch = !!searchQuery.trim();
+      if (hasLetterFilter || hasSearch) {
+        items = filteredAll;
+      } else {
+        // No filters: show filtered items first (which equals discovered) then the rest (none)
+        const filteredIds = new Set(filteredAll.map(x => x.id));
+        const rest = discovered.filter(d => !filteredIds.has(d.id));
+        items = [...filteredAll, ...rest];
+      }
     }
-    // When letter filter or search is active, show only filteredAll
-    const hasLetterFilter = !!invFilter;
-    const hasSearch = !!searchQuery.trim();
-    if (hasLetterFilter || hasSearch) return filteredAll;
-    // No filters: show filtered items first (which equals discovered) then the rest (none)
-    const filteredIds = new Set(filteredAll.map(x => x.id));
-    const rest = discovered.filter(d => !filteredIds.has(d.id));
-    return [...filteredAll, ...rest];
+    
+    // Remove duplicates by id
+    const uniqueItems = items.filter((item, index, self) => 
+      index === self.findIndex(i => i.id === item.id)
+    );
+    
+    return uniqueItems;
   }, [activeTab, filteredAll, discovered, recent, invFilter, searchQuery]);
 
   const spawnAtCanvasCenter = (item: WordItem) => {
@@ -203,6 +266,92 @@ export default function App() {
     setPlaced([]);
   }, [daily]);
 
+  // โหลดโจทย์และ global recipes จาก Firestore
+  useEffect(() => {
+    let cancelled = false;
+    async function loadRemote() {
+      try {
+        // Show loading screen
+        setIsLoading(true);
+        
+        // Clear any cached data first
+        setDailyOverride(null);
+        setRecipesOverride(null);
+        
+        let fbConfig: any = undefined;
+        try { fbConfig = require('./firebase.config.json'); } catch (e) { fbConfig = undefined; }
+        
+        console.log('🔄 Loading fresh data from Firestore for date:', dateISO);
+        
+        // Load puzzle and global recipes in parallel
+        const [puzzleDoc, globalRecipes] = await Promise.all([
+          fetchPuzzleForDate(dateISO, fbConfig),
+          fetchGlobalRecipes(fbConfig)
+        ]);
+        
+        if (cancelled) return;
+        
+        // Set puzzle data
+        if (puzzleDoc) {
+          const toItem = (name: string, type?: WordItem['type']): WordItem => ({ id: slugify(name), name, type });
+          const goalName = puzzleDoc.goalWord || 'Electricity';
+          const starts = (puzzleDoc.startWords && puzzleDoc.startWords.length >= 2 ? puzzleDoc.startWords : ['Water','Earth']).slice(0, 2);
+          const goal = toItem(goalName, 'goal');
+          const startWords = starts.map(n => toItem(n, 'start')) as WordItem[];
+          console.log('✅ Loaded puzzle from Firestore:', { goal: goalName, starts });
+          setDailyOverride({ goal, startWords });
+        } else {
+          console.log('⚠️ No puzzle data found in Firestore, using local fallback');
+          setDailyOverride(null);
+        }
+        
+        // Set global recipes
+        if (globalRecipes) {
+          const mapped: Record<string, WordItem> = {};
+          for (const k of Object.keys(globalRecipes)) {
+            const r = globalRecipes[k];
+            mapped[k.toLowerCase()] = { id: r.id || slugify(r.name), name: r.name || '', type: r.type ?? 'result' } as WordItem;
+          }
+          console.log('✅ Loaded', Object.keys(mapped).length, 'global recipes from Firestore');
+          setRecipesOverride(mapped);
+        } else {
+          console.log('⚠️ No global recipes found in Firestore, using local fallback');
+          setRecipesOverride(null);
+        }
+        
+        // Hide loading screen
+        setIsLoading(false);
+      } catch (e) {
+        console.error('❌ Error loading data:', e);
+        setDailyOverride(null);
+        setRecipesOverride(null);
+        setIsLoading(false);
+      }
+    }
+    loadRemote();
+    return () => { cancelled = true; };
+  }, [dateISO, forceReload]); // Add forceReload dependency
+
+  // Force reload on app start to ensure fresh data
+  useEffect(() => {
+    console.log('🚀 App started, forcing fresh data load...');
+    setForceReload(prev => prev + 1);
+  }, []);
+
+  // Force reload when screen becomes active (for web refresh)
+  useEffect(() => {
+    const handleFocus = () => {
+      console.log('🔄 Screen focused, forcing data reload...');
+      setForceReload(prev => prev + 1);
+    };
+    
+    // For web, listen to visibility change
+    if (typeof document !== 'undefined') {
+      document.addEventListener('visibilitychange', handleFocus);
+      return () => document.removeEventListener('visibilitychange', handleFocus);
+    }
+  }, []);
+
   const ensureInDiscovered = (item: WordItem) => {
     setDiscovered(prev => {
       if (prev.find(w => w.id === item.id)) return prev;
@@ -244,19 +393,19 @@ export default function App() {
   };
 
   const findRecipe = (aId: string, bId: string): WordItem | null => {
-    const fromRecipe = RECIPES[stableKey(aId, bId)];
-    if (fromRecipe) return fromRecipe;
-    const a = discovered.find(d => d.id === aId) || WORDS.find(w => w.id === aId);
-    const b = discovered.find(d => d.id === bId) || WORDS.find(w => w.id === bId);
-    if (!a || !b) return null;
-    const name = `${a.name} ${b.name}`;
-    const idBase = slugify(name) || `${aId}-${bId}`;
-    let id = idBase; let n = 2;
-    while (discovered.find(d => d.id === id)) { id = `${idBase}-${n++}`; }
-    return { id, name, type: 'result' };
+    const key = stableKey(aId, bId);
+    
+    // Use global recipes from Firestore
+    if (recipesOverride && recipesOverride[key]) {
+      return recipesOverride[key];
+    }
+    
+    // Fallback: try AI recipe generation via Cloud Function
+    return null; // Will trigger AI recipe request in combineIfOverlapByUid
   };
 
-  const combineIfOverlapByUid = (uidA: number) => {
+  const combineIfOverlapByUid = async (uidA: number) => {
+    setIsCombining(true);
     setPlaced(prev => {
       const idxA = prev.findIndex(p => p.uid === uidA); if (idxA === -1) return prev;
       const a = prev[idxA];
@@ -267,7 +416,30 @@ export default function App() {
         const rectB = { left: b.x, top: b.y, right: b.x + 100, bottom: b.y + 44 };
         const overlap = !(rectA.right < rectB.left || rectA.left > rectB.right || rectA.bottom < rectB.top || rectA.top > rectB.bottom);
         if (!overlap) continue;
-        const result = findRecipe(a.id, b.id); if (!result) continue;
+        const result = findRecipe(a.id, b.id);
+        if (!result) {
+          // เรียก AI แบบ async ถ้าไม่มีสูตร
+          (async () => {
+            try {
+              let fbConfig: any = undefined;
+              try { fbConfig = require('./firebase.config.json'); } catch (e) { fbConfig = undefined; }
+              const ai = await requestAIRecipe(dateISO, a.id, b.id, fbConfig);
+              if (!ai) return;
+              const cxAI = (a.x + b.x) / 2; const cyAI = (a.y + b.y) / 2;
+              ensureInDiscovered({ id: ai.id, name: ai.name, type: ai.type });
+              setPlaced(cur => {
+                const rem = cur.filter(x => x.uid !== a.uid && x.uid !== b.uid);
+                const uid = nextUidRef.current++;
+                rem.push({ uid, id: ai.id, name: ai.name, type: ai.type, x: cxAI, y: cyAI, z: 99 });
+                return rem;
+              });
+            } catch {}
+            finally {
+              setIsCombining(false);
+            }
+          })();
+          return prev;
+        }
         const cx = (a.x + b.x) / 2; const cy = (a.y + b.y) / 2;
         const next: Placed[] = prev.filter((_, j) => j !== idxA && j !== i);
         const uid = nextUidRef.current++;
@@ -277,8 +449,10 @@ export default function App() {
         if (result.id === daily.goal.id) {
           Alert.alert('สำเร็จ!', `คุณสร้าง ${daily.goal.name} ได้แล้ว!`);
         }
+        setIsCombining(false);
         return next;
       }
+      setIsCombining(false);
       return prev;
     });
   };
@@ -293,7 +467,27 @@ export default function App() {
         const rectB = { left: b.x, top: b.y, right: b.x + 100, bottom: b.y + 44 };
         const overlap = !(rectGhost.right < rectB.left || rectGhost.left > rectB.right || rectGhost.bottom < rectB.top || rectGhost.top > rectB.bottom);
         if (!overlap) continue;
-        const result = findRecipe(dragItem.id, b.id); if (!result) continue;
+        const result = findRecipe(dragItem.id, b.id);
+        if (!result) {
+          // เรียก AI แบบ async ถ้าไม่มีสูตร
+          (async () => {
+            try {
+              let fbConfig: any = undefined;
+              try { fbConfig = require('./firebase.config.json'); } catch (e) { fbConfig = undefined; }
+              const ai = await requestAIRecipe(dateISO, dragItem.id, b.id, fbConfig);
+              if (!ai) return;
+              const cxAI = (x + b.x) / 2; const cyAI = (y + b.y) / 2;
+              ensureInDiscovered({ id: ai.id, name: ai.name, type: ai.type });
+              setPlaced(cur => {
+                const rem = cur.filter((_, j) => j !== i);
+                const uid = nextUidRef.current++;
+                rem.push({ uid, id: ai.id, name: ai.name, type: ai.type, x: cxAI, y: cyAI, z: 1 });
+                return rem;
+              });
+            } catch {}
+          })();
+          return prev;
+        }
         const cx = (x + b.x) / 2; const cy = (y + b.y) / 2;
         const next: Placed[] = prev.filter((_, j) => j !== i);
         const uid = nextUidRef.current++;
@@ -498,6 +692,9 @@ export default function App() {
           <View style={[homeStyles.card, isDark ? homeStylesDark.card : homeStylesLight.card]}>
             <Text style={[homeStyles.cardLabel, isDark ? homeStylesDark.cardLabel : homeStylesLight.cardLabel]} selectable={false}>Today's game:</Text>
             <Text style={[homeStyles.cardNumber, isDark ? homeStylesDark.cardNumber : homeStylesLight.cardNumber]} selectable={false}>#{gameNo}</Text>
+            <Text style={[homeStyles.cardLabel, isDark ? homeStylesDark.cardLabel : homeStylesLight.cardLabel]} selectable={false}>
+              {getTodayISO()} (epoch {getEpochISO()})
+            </Text>
             <TouchableOpacity style={[homeStyles.primaryBtn, isDark ? homeStylesDark.primaryBtn : homeStylesLight.primaryBtn]} onPress={() => setScreen('game')}>
               <Text style={[homeStyles.primaryBtnText, isDark ? homeStylesDark.primaryBtnText : homeStylesLight.primaryBtnText]} selectable={false}>Continue</Text>
             </TouchableOpacity>
@@ -513,6 +710,24 @@ export default function App() {
             <TouchableOpacity style={[homeStyles.menuItem, isDark ? homeStylesDark.menuItem : homeStylesLight.menuItem]} onPress={() => setScreen('settings')}>
               <Text style={[homeStyles.menuText, isDark ? homeStylesDark.menuText : homeStylesLight.menuText]} selectable={false}>Settings</Text>
             </TouchableOpacity>
+          </View>
+        </View>
+      </SafeAreaView>
+    );
+  }
+
+  // Show loading screen until data is loaded
+  if (isLoading) {
+    return (
+      <SafeAreaView style={[styles.container, isDark ? stylesDark.container : stylesLight.container]}>
+        <View style={[styles.loadingOverlay, isDark ? stylesDark.loadingOverlay : stylesLight.loadingOverlay]}>
+          <View style={[styles.loadingContent, isDark ? stylesDark.loadingContent : stylesLight.loadingContent]}>
+            <Text style={[styles.loadingText, isDark ? stylesDark.loadingText : stylesLight.loadingText]}>
+              🔄 Loading...
+            </Text>
+            <Text style={[styles.loadingSubtext, isDark ? stylesDark.loadingSubtext : stylesLight.loadingSubtext]}>
+              Fetching puzzle and recipes from Firestore
+            </Text>
           </View>
         </View>
       </SafeAreaView>
@@ -566,6 +781,21 @@ export default function App() {
               );
             })}
           </View>
+          
+          {/* Combining Overlay */}
+          {isCombining && (
+            <View style={[styles.loadingOverlay, isDark ? stylesDark.loadingOverlay : stylesLight.loadingOverlay]}>
+              <View style={[styles.loadingContent, isDark ? stylesDark.loadingContent : stylesLight.loadingContent]}>
+                <Text style={[styles.loadingText, isDark ? stylesDark.loadingText : stylesLight.loadingText]}>
+                  🔄 Combining...
+                </Text>
+                <Text style={[styles.loadingSubtext, isDark ? stylesDark.loadingSubtext : stylesLight.loadingSubtext]}>
+                  Creating new recipe
+                </Text>
+              </View>
+            </View>
+          )}
+          
           <TouchableOpacity style={[styles.button, isDark ? stylesDark.button : stylesLight.button]} onPress={() => setPlaced([])}> 
             <Text style={[styles.buttonText, isDark ? stylesDark.buttonText : stylesLight.buttonText]} selectable={false}>Clear</Text>
           </TouchableOpacity>
@@ -598,10 +828,10 @@ export default function App() {
           )}
         </View>
         <ScrollView horizontal showsHorizontalScrollIndicator contentContainerStyle={styles.inventoryWrapHorizontal}>
-          {tabItems.map(item => {
+          {tabItems.map((item, index) => {
             const isFav = favorites.includes(item.id);
             return (
-              <View key={item.id} style={styles.inventoryItemWrapper}> 
+              <View key={`${item.id}-${index}`} style={styles.inventoryItemWrapper}> 
                 <TouchableOpacity onPress={() => { spawnOnCanvas(item); ensureInDiscovered(item); pushRecent(item.id); }}>
                   <View style={[styles.item, item.type === 'start' && styles.itemStart, item.id === daily.goal.id && styles.itemGoal]}>
                     <Text selectable={false} numberOfLines={1} ellipsizeMode="tail">{item.name}</Text>
@@ -636,12 +866,10 @@ export default function App() {
         </ScrollView>
       </View>
       <View style={[styles.banner, isDark ? stylesDark.banner : stylesLight.banner]}>
-        <AdMobBanner
-          bannerSize="smartBannerPortrait"
-          adUnitID="ca-app-pub-3940256099942544/6300978111"
-          servePersonalizedAds
-          onDidFailToReceiveAdWithError={(e) => console.log('Ad error', e)}
-        />
+        {/* AdMobBanner disabled for web compatibility */}
+        <Text style={[styles.bannerText, isDark ? stylesDark.bannerText : stylesLight.bannerText]}>
+          AdMobBanner component not supported on the web
+        </Text>
       </View>
     </SafeAreaView>
   );
@@ -686,6 +914,11 @@ const styles = StyleSheet.create({
   dragGhost: { position: 'absolute', backgroundColor: '#fff', paddingHorizontal: 12, paddingVertical: 10, borderRadius: 12, borderColor: 'rgba(0,0,0,0.08)', borderWidth: 1, opacity: 0.95, zIndex: 9999, elevation: 10, userSelect: 'none' as any, cursor: 'default' as any },
   dragGhostOverlay: { position: 'absolute', backgroundColor: '#fff', paddingHorizontal: 12, paddingVertical: 10, borderRadius: 12, borderColor: 'rgba(0,0,0,0.08)', borderWidth: 1, opacity: 0.95, zIndex: 99999, elevation: 20, userSelect: 'none' as any, cursor: 'default' as any, left: 0, top: 0 },
   banner: { borderTopWidth: StyleSheet.hairlineWidth, borderTopColor: 'rgba(255,255,255,0.12)' },
+  bannerText: { color: '#a8b0d4', textAlign: 'center', paddingVertical: 8, fontSize: 12 },
+  loadingOverlay: { position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: 'rgba(0,0,0,0.8)', zIndex: 1000, justifyContent: 'center', alignItems: 'center' },
+  loadingContent: { backgroundColor: 'rgba(255,255,255,0.95)', padding: 24, borderRadius: 16, alignItems: 'center', minWidth: 200 },
+  loadingText: { fontSize: 18, fontWeight: '600', marginBottom: 8, color: '#1f2937' },
+  loadingSubtext: { fontSize: 14, color: '#6b7280', textAlign: 'center' },
   // Persistent Inventory Dock styles
   inventoryDock: { paddingTop: 6, paddingHorizontal: 12, paddingBottom: 10, borderTopLeftRadius: 0, borderTopRightRadius: 0, borderTopWidth: 0, borderTopColor: 'transparent' },
   inventoryHeaderRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 },
@@ -736,6 +969,11 @@ const stylesDark = StyleSheet.create({
   radioChip: { backgroundColor: '#22283f', borderColor: 'transparent' },
   radioChipActive: { borderColor: '#7affb2' },
   banner: { borderTopColor: 'rgba(255,255,255,0.12)' },
+  bannerText: { color: '#a8b0d4' },
+  loadingOverlay: { backgroundColor: 'rgba(0,0,0,0.9)' },
+  loadingContent: { backgroundColor: 'rgba(30,30,30,0.95)' },
+  loadingText: { color: '#eef1ff' },
+  loadingSubtext: { color: '#a8b0d4' },
 });
 
 const stylesLight = StyleSheet.create({
@@ -764,6 +1002,11 @@ const stylesLight = StyleSheet.create({
   radioChip: { backgroundColor: '#e9ecf5', borderColor: 'transparent' },
   radioChipActive: { borderColor: '#2b6cb0' },
   banner: { borderTopColor: 'rgba(0,0,0,0.12)' },
+  bannerText: { color: '#6b7280' },
+  loadingOverlay: { backgroundColor: 'rgba(0,0,0,0.8)' },
+  loadingContent: { backgroundColor: 'rgba(255,255,255,0.95)' },
+  loadingText: { color: '#1f2937' },
+  loadingSubtext: { color: '#6b7280' },
 });
 
 const homeStyles = StyleSheet.create({
@@ -771,25 +1014,25 @@ const homeStyles = StyleSheet.create({
   headerSpace: { height: 0 },
   centerWrap: { flex: 1, alignItems: 'center', justifyContent: 'center', paddingHorizontal: 24 },
   brand: { fontSize: 36, fontWeight: '800', color: '#2a2a2a', letterSpacing: 2, marginBottom: 18, textTransform: 'uppercase' as any },
-  card: { backgroundColor: '#ffffff', padding: 24, borderRadius: 16, width: '86%', maxWidth: 360, alignItems: 'center', shadowColor: '#000', shadowOpacity: 0.07, shadowOffset: { width: 0, height: 6 }, shadowRadius: 14, elevation: 2 },
+  card: { backgroundColor: '#ffffff', padding: 24, borderRadius: 16, width: '86%', maxWidth: 360, alignItems: 'center', boxShadow: '0 6px 14px rgba(0, 0, 0, 0.07)', elevation: 2 },
   cardLabel: { color: '#585858', marginBottom: 8, fontSize: 16 },
   cardNumber: { color: '#1b1f2a', fontSize: 28, fontWeight: '800', marginBottom: 14 },
   primaryBtn: { backgroundColor: '#2b6cb0', paddingVertical: 12, paddingHorizontal: 20, borderRadius: 12, alignSelf: 'stretch', alignItems: 'center' },
   primaryBtnText: { color: '#ffffff', fontWeight: '800', fontSize: 16 },
   menu: { width: '86%', maxWidth: 420, marginTop: 28 },
-  menuItem: { backgroundColor: '#ffffff', paddingVertical: 14, paddingHorizontal: 16, borderRadius: 12, marginBottom: 12, shadowColor: '#000', shadowOpacity: 0.04, shadowOffset: { width: 0, height: 4 }, shadowRadius: 10, elevation: 1 },
+  menuItem: { backgroundColor: '#ffffff', paddingVertical: 14, paddingHorizontal: 16, borderRadius: 12, marginBottom: 12, boxShadow: '0 4px 10px rgba(0, 0, 0, 0.04)', elevation: 1 },
   menuText: { color: '#3a3a3a', fontSize: 16 }
 });
 
 const homeStylesDark = StyleSheet.create({
   container: { backgroundColor: '#0f1222' },
   brand: { color: '#eef1ff' },
-  card: { backgroundColor: '#151a33', shadowOpacity: 0.2 },
+  card: { backgroundColor: '#151a33', boxShadow: '0 6px 14px rgba(0, 0, 0, 0.2)' },
   cardLabel: { color: '#a8b0d4' },
   cardNumber: { color: '#eef1ff' },
   primaryBtn: { backgroundColor: '#2b6cb0' },
   primaryBtnText: { color: '#ffffff' },
-  menuItem: { backgroundColor: '#151a33', shadowOpacity: 0.12 },
+  menuItem: { backgroundColor: '#151a33', boxShadow: '0 4px 10px rgba(0, 0, 0, 0.12)' },
   menuText: { color: '#eef1ff' },
 });
 

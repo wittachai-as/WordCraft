@@ -1,0 +1,29 @@
+{
+  "goalWord": "Love",
+  "startWords": [
+    "Fire",
+    "Heart"
+  ],
+  "recipes": {
+    "fire+heart": {
+      "name": "Soul",
+      "type": "result"
+    },
+    "fire+love": {
+      "name": "Passion",
+      "type": "result"
+    },
+    "heart+love": {
+      "name": "Passion",
+      "type": "result"
+    },
+    "heart+soul": {
+      "name": "Spirit",
+      "type": "result"
+    },
+    "heart+passion": {
+      "name": "Love",
+      "type": "result"
+    }
+  }
+}
