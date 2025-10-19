@@ -44,3 +44,10 @@ firebase-debug.log
 **/firebase-adminsdk.json
 **/*-firebase-adminsdk-*.json
 firebase-adminsdk*.json
+
+# Dart/Flutter
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.packages
+build/
