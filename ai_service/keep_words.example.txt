@@ -1,0 +1,13 @@
+# บรรทัดละ 1 คำที่จะเก็บไว้ในไฟล์ .vec ที่ย่อแล้ว
+# ลบ # ทิ้งเมื่อใช้งานจริง และปรับแก้รายการคำตามต้องการ
+apple
+orange
+banana
+steam
+water
+cook
+boil
+sweet
+spicy
+salty
+

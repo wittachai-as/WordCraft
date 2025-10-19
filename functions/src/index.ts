@@ -28,11 +28,8 @@ async function computeAndCache(dateISO: string, a: string, b: string): Promise<R
       return { id: hit.id || slugify(hit.name), name: hit.name, type: (hit.type as any) || 'result' };
     }
   }
-  const AI_URL = functions.config().ai?.service_url;
-  if (!AI_URL) {
-    console.error('AI_SERVICE_URL not configured');
-    return null;
-  }
+  const AI_URL = functions.config().ai?.service_url || 'http://127.0.0.1:8099';
+  console.log('Using AI service URL:', AI_URL);
   const resp = await fetch(`${AI_URL}/combine`, {
     method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ a, b })
   });

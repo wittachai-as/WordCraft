@@ -1,6 +1,11 @@
 # macOS
 .DS_Store
 
+# Environment variables
+.env
+.env.local
+*.env
+
 # Node / Expo for mobile app
 mobile/node_modules/
 mobile/.expo/
@@ -11,3 +16,29 @@ mobile/npm-debug.log*
 mobile/yarn-debug.log*
 mobile/yarn-error.log*
 node_modules
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+wordcraft_venv/
+venv/
+ENV/
+
+# AI Service
+ai_service/__pycache__/
+*.vec
+*.vec.gz
+*.bin
+*.bin.gz
+
+# Firebase
+.firebase/
+firebase-debug.log
+
+# Firebase credentials (DO NOT COMMIT!)
+**/firebase-adminsdk.json
+**/*-firebase-adminsdk-*.json
+firebase-adminsdk*.json

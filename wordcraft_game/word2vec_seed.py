@@ -89,7 +89,8 @@ def pick_candidate(a: str, b: str, model: "KeyedVectors") -> str:
                     len(token) > 2 and
                     not _is_trivial_variant(token, [a, b])):
                     return token.capitalize()
-    except Exception:
+    except (KeyError, ValueError) as e:
+        print(f"Warning: Error in pick_candidate for '{a}' + '{b}': {e}")
         pass
     
     # ห้ามต่อคำ - ถ้าไม่มี Word2Vec ก็ return None
@@ -150,8 +151,9 @@ def main():
             is_binary = args.model.endswith('.bin') or args.model.endswith('.gz')
             model = KeyedVectors.load_word2vec_format(args.model, binary=is_binary)
             print(f"Loaded Word2Vec model from {args.model}")
-        except Exception as e:
+        except (IOError, ValueError, KeyError) as e:
             print(f"Failed to load Word2Vec model: {e}")
+            print("Continuing without model...")
     else:
         print("No Word2Vec model provided. AI-only mode requires --model.")
     

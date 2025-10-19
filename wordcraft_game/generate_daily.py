@@ -10,11 +10,11 @@ Usage:
 
 import argparse
 import json
-import random
 from datetime import datetime
 from typing import List, Set
 
-from word2vec_seed import generate_recipes
+# Remove random import - we use pure deterministic seed-based generation
+# from word2vec_seed import generate_recipes  # Not needed for puzzle generation
 
 
 def _seed_from_date_str(seed_str: str) -> int:
@@ -52,7 +52,7 @@ def save_used_goal(goal: str):
         f.write(f"{goal.lower()}\n")
 
 
-def generate_daily_puzzle(date_str: str, deterministic: bool = False) -> dict:
+def generate_daily_puzzle(date_str: str, deterministic: bool = True) -> dict:
     # Word pools
     START_WORDS = [
         "Water", "Fire", "Earth", "Air", "Light", "Dark", "Heat", "Cold",

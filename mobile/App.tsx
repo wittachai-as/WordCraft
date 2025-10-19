@@ -2,8 +2,35 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { SafeAreaView, View, Text, StyleSheet, TouchableOpacity, FlatList, Alert, PanResponder, LayoutRectangle, Animated, Platform, useWindowDimensions, ScrollView, TextInput, useColorScheme } from 'react-native';
 // import { AdMobBanner } from 'expo-ads-admob'; // Disabled for web compatibility
 import { fetchPuzzleForDate, fetchGlobalRecipes, requestAIRecipe } from './firebase';
+import { getUsedCombos, addUsedCombo, comboKey, appendHistory, clearAllForPuzzle, getDiscoveredWords, setDiscoveredWords, DiscoveredWord, getHistory, PlayItem } from './storage/history';
+import { syncHistory } from './storage/syncHistory';
+import { testSync } from './storage/test-sync';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 
 type WordItem = { id: string; name: string; type?: 'start' | 'goal' | 'result' };
+
+// Guest user management
+const GUEST_USER_KEY = 'guest_user_id';
+const generateGuestId = () => `guest_${Date.now()}_${Math.random().toString(36).substring(2, 11)}`;
+
+async function getOrCreateGuestUser(): Promise<string> {
+  try {
+    let guestId = await AsyncStorage.getItem(GUEST_USER_KEY);
+    if (!guestId) {
+      guestId = generateGuestId();
+      await AsyncStorage.setItem(GUEST_USER_KEY, guestId);
+      console.log('👤 [AUTH] Created new guest user:', guestId);
+    } else {
+      console.log('👤 [AUTH] Loaded existing guest user:', guestId);
+    }
+    return guestId;
+  } catch (error) {
+    console.error('❌ [AUTH] Error managing guest user:', error);
+    const fallbackId = generateGuestId();
+    console.log('👤 [AUTH] Using fallback guest ID:', fallbackId);
+    return fallbackId;
+  }
+}
 
 function getTodayISO(): string {
   const d = new Date();
@@ -94,12 +121,14 @@ function pickDaily(dateISO: string) {
 type Placed = { uid: number; id: string; name: string; type?: WordItem['type']; x: number; y: number; z: number };
 
 export default function App() {
-  const [screen, setScreen] = useState<'home' | 'game' | 'history' | 'howto' | 'settings'>('home');
+  const [screen, setScreen] = useState<'home' | 'game' | 'history' | 'howto' | 'settings' | 'victory'>('home');
   const [menuOpen, setMenuOpen] = useState(false);
   const scheme = useColorScheme();
   const [colorMode, setColorMode] = useState<'system' | 'light' | 'dark'>('system');
   const effectiveScheme = colorMode === 'system' ? scheme : colorMode;
   const isDark = effectiveScheme !== 'light';
+  const [hasWon, setHasWon] = useState(false);
+  const [shakeAnimation] = useState(new Animated.Value(0));
 
   const [dateISO, setDateISO] = useState(getTodayISO());
   const [dailyOverride, setDailyOverride] = useState<{ goal: WordItem; startWords: WordItem[] } | null>(null);
@@ -107,22 +136,97 @@ export default function App() {
   const [forceReload, setForceReload] = useState(0); // Force reload counter
   const [isLoading, setIsLoading] = useState(true); // Loading state
   const [isCombining, setIsCombining] = useState(false); // Combining state
-  const daily = useMemo(() => dailyOverride ?? pickDaily(dateISO), [dailyOverride, dateISO]);
+  const [guestUserId, setGuestUserId] = useState<string | null>(null); // Guest user ID
+  // Always use seed-based generation from AI Service (no fallback to prevent flickering)
+  const daily = useMemo(() => {
+    // Use dailyOverride from AI Service, fallback to pickDaily only as last resort
+    return dailyOverride ?? pickDaily(dateISO);
+  }, [dailyOverride, dateISO]);
   const [discovered, setDiscovered] = useState<WordItem[]>([]);
   const [placed, setPlaced] = useState<Placed[]>([]);
+  // Selection-based mixing (A/B)
+  const [currentA, setCurrentA] = useState<string | null>(null);
+  const [currentB, setCurrentB] = useState<string | null>(null);
+  const [lastResult, setLastResult] = useState<string | null>(null);
+  const [usedCombos, setUsedCombos] = useState<Set<string>>(new Set());
+  const [historyItems, setHistoryItems] = useState<PlayItem[]>([]);
+  const [isLoadingHistory, setIsLoadingHistory] = useState(false);
+  const usedWords = useMemo(() => {
+    const out = new Set<string>();
+    usedCombos.forEach(k => {
+      const parts = k.split('|');
+      if (parts[0]) out.add(parts[0]);
+      if (parts[1]) out.add(parts[1]);
+    });
+    return out;
+  }, [usedCombos]);
   const nextUidRef = useRef(1);
   const [zCounter, setZCounter] = useState(1);
   const canvasRef = useRef<View>(null);
   const canvasRect = useRef<LayoutRectangle | null>(null);
 
   // Update discovered when daily changes
+  // Initialize guest user
   useEffect(() => {
-    // Remove duplicates by id
-    const uniqueWords = daily.startWords.filter((word, index, self) => 
-      index === self.findIndex(w => w.id === word.id)
-    );
-    setDiscovered(uniqueWords);
-    setPlaced([]); // Clear placed items when daily changes
+    (async () => {
+      console.log('🚀 [AUTH] Initializing guest user...');
+      const guestId = await getOrCreateGuestUser();
+      setGuestUserId(guestId);
+      console.log('✅ [AUTH] Guest user initialized in state:', guestId);
+    })();
+  }, []);
+
+  // 🧪 Test Firebase sync (TEMPORARY - for debugging)
+  useEffect(() => {
+    if (guestUserId) {
+      console.log('🧪 [TEST] Guest user ready, running sync test...');
+      testSync(guestUserId).catch(err => {
+        console.error('🧪 [TEST] Test sync failed:', err);
+      });
+    }
+  }, [guestUserId]);
+
+  // Load history when screen changes to history or victory
+  useEffect(() => {
+    if (screen === 'history' || screen === 'victory') {
+      (async () => {
+        try {
+          setIsLoadingHistory(true);
+          console.log('Loading history for dateISO:', dateISO);
+          const history = await getHistory(dateISO);
+          console.log('History loaded:', history);
+          setHistoryItems(history);
+        } catch (error) {
+          console.error('Error loading history:', error);
+          setHistoryItems([]);
+        } finally {
+          setIsLoadingHistory(false);
+        }
+      })();
+    }
+  }, [screen, dateISO]);
+
+  useEffect(() => {
+    (async () => {
+      // base discovered = daily starts
+      const uniqueWords = daily.startWords.filter((word, index, self) => index === self.findIndex(w => w.id === word.id));
+      // merge with persisted discovered list for today
+      let persisted: DiscoveredWord[] = [];
+      try { persisted = await getDiscoveredWords(dateISO); } catch {}
+      const persistedItems = persisted.map(w => ({ id: w.id.toLowerCase(), name: w.name, type: 'result' as const }));
+      const merged = [...uniqueWords];
+      for (const p of persistedItems) {
+        if (!merged.find(u => u.id === p.id)) merged.push(p);
+      }
+      setDiscovered(merged);
+      setPlaced([]);
+      setCurrentA(null);
+      setCurrentB(null);
+      try {
+        const used = await getUsedCombos(dateISO);
+        setUsedCombos(used);
+      } catch {}
+    })();
   }, [daily]);
 
   // drag ghost state
@@ -131,8 +235,18 @@ export default function App() {
   const [dragging, setDragging] = useState(false);
   const longPressTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const dragActiveRef = useRef(false);
-  const { width } = useWindowDimensions();
+  const { width, height } = useWindowDimensions();
   const isStacked = Platform.OS !== 'web' || width < 800; // มือถือ/จอแคบ: ใช้เลย์เอาต์บน-ล่าง
+  
+  // Responsive inventory height based on screen size
+  // คำนวณจากความสูงหน้าจอ ลบด้วย header, mixing section, banner และ spacing
+  const HEADER_HEIGHT = 64;
+  const MIXING_SECTION_HEIGHT = 200; // ~Box A+B, =, Result, Mix button (reduced)
+  const BANNER_HEIGHT = 40;
+  
+  // Dynamic RESERVED_SPACE based on screen height for better responsiveness
+  // iPhone SE (568-667px) needs less reserved space
+  const RESERVED_SPACE = height < 700 ? 480 : 620;
 
   // anchor สำหรับลากจาก Inventory (ยังใช้ใน makeInventoryDrag)
   const invAnchor = useRef({ x: 50, y: 22 });
@@ -176,9 +290,18 @@ export default function App() {
     }
     
     // Remove duplicates by id
-    return result.filter((item, index, self) => 
+    const unique = result.filter((item, index, self) => 
       index === self.findIndex(i => i.id === item.id)
     );
+    
+    // Separate start words from other words
+    const startWords = unique.filter(item => item.type === 'start');
+    const otherWords = unique.filter(item => item.type !== 'start');
+    
+    // Sort other words by name A-Z, keep start words at the beginning
+    const sortedOtherWords = otherWords.sort((a, b) => (a.name || a.id).localeCompare(b.name || b.id));
+    
+    return [...startWords, ...sortedOtherWords];
   }, [discovered, invFilter, searchQuery]);
   const favoriteItems = useMemo(() => filteredAll.filter(d => favorites.includes(d.id)), [filteredAll, favorites]);
   const nonFavoriteItems = useMemo(() => filteredAll.filter(d => !favorites.includes(d.id)), [filteredAll, favorites]);
@@ -266,7 +389,7 @@ export default function App() {
     setPlaced([]);
   }, [daily]);
 
-  // โหลดโจทย์และ global recipes จาก Firestore
+  // โหลดโจทย์จาก AI Service (Word2Vec vocab) และ global recipes
   useEffect(() => {
     let cancelled = false;
     async function loadRemote() {
@@ -274,58 +397,83 @@ export default function App() {
         // Show loading screen
         setIsLoading(true);
         
-        // Clear any cached data first
-        setDailyOverride(null);
-        setRecipesOverride(null);
+        // Load puzzle from AI Service (Word2Vec vocabulary)
+        console.log('🎲 Loading puzzle from AI Service for date:', dateISO);
+        const AI_SERVICE_URL = process.env.EXPO_PUBLIC_AI_SERVICE_URL || 'http://127.0.0.1:8099';
         
-        let fbConfig: any = undefined;
-        try { fbConfig = require('./firebase.config.json'); } catch (e) { fbConfig = undefined; }
-        
-        console.log('🔄 Loading fresh data from Firestore for date:', dateISO);
-        
-        // Load puzzle and global recipes in parallel
-        const [puzzleDoc, globalRecipes] = await Promise.all([
-          fetchPuzzleForDate(dateISO, fbConfig),
-          fetchGlobalRecipes(fbConfig)
-        ]);
-        
-        if (cancelled) return;
-        
-        // Set puzzle data
-        if (puzzleDoc) {
-          const toItem = (name: string, type?: WordItem['type']): WordItem => ({ id: slugify(name), name, type });
-          const goalName = puzzleDoc.goalWord || 'Electricity';
-          const starts = (puzzleDoc.startWords && puzzleDoc.startWords.length >= 2 ? puzzleDoc.startWords : ['Water','Earth']).slice(0, 2);
-          const goal = toItem(goalName, 'goal');
-          const startWords = starts.map(n => toItem(n, 'start')) as WordItem[];
-          console.log('✅ Loaded puzzle from Firestore:', { goal: goalName, starts });
-          setDailyOverride({ goal, startWords });
-        } else {
-          console.log('⚠️ No puzzle data found in Firestore, using local fallback');
-          setDailyOverride(null);
-        }
-        
-        // Set global recipes
-        if (globalRecipes) {
-          const mapped: Record<string, WordItem> = {};
-          for (const k of Object.keys(globalRecipes)) {
-            const r = globalRecipes[k];
-            mapped[k.toLowerCase()] = { id: r.id || slugify(r.name), name: r.name || '', type: r.type ?? 'result' } as WordItem;
+        try {
+          const puzzleResponse = await fetch(`${AI_SERVICE_URL}/daily_puzzle`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ date: dateISO })
+          });
+          
+          if (puzzleResponse.ok) {
+            const puzzleData = await puzzleResponse.json();
+            const goal = toItem(puzzleData.goalWord, 'goal');
+            const startWords = puzzleData.startWords.map((n: string) => toItem(n, 'start'));
+            console.log('✅ Generated puzzle from Word2Vec:', { 
+              goal: puzzleData.goalWord, 
+              starts: puzzleData.startWords,
+              vocab_size: puzzleData.vocab_size 
+            });
+            setDailyOverride({ goal, startWords });
+          } else {
+            console.log('⚠️ AI Service unavailable, using local fallback');
+            const localPuzzle = pickDaily(dateISO);
+            setDailyOverride(localPuzzle);
           }
-          console.log('✅ Loaded', Object.keys(mapped).length, 'global recipes from Firestore');
-          setRecipesOverride(mapped);
-        } else {
-          console.log('⚠️ No global recipes found in Firestore, using local fallback');
-          setRecipesOverride(null);
+        } catch (aiError) {
+          console.log('⚠️ Cannot connect to AI Service, using local fallback');
+          const localPuzzle = pickDaily(dateISO);
+          setDailyOverride(localPuzzle);
         }
         
-        // Hide loading screen
-        setIsLoading(false);
+        // Loading screen will auto-hide via useEffect when dailyOverride is set
+        // Don't manually setIsLoading(false) here to prevent flickering
+        
+        // Load global recipes from Firestore in background (optional - for pre-computed combinations)
+        // This won't block the app from loading
+        (async () => {
+          let fbConfig: any = undefined;
+          try { fbConfig = require('./firebase.config.json'); } catch (e) { fbConfig = undefined; }
+          
+          if (!fbConfig) {
+            console.log('⚠️ No Firebase config, AI will generate on-the-fly');
+            setRecipesOverride(null);
+            return;
+          }
+          
+          try {
+            const globalRecipes = await fetchGlobalRecipes(fbConfig);
+            
+            if (cancelled) return;
+            
+            // Set global recipes
+            if (globalRecipes) {
+              const mapped: Record<string, WordItem> = {};
+              for (const k of Object.keys(globalRecipes)) {
+                const r = globalRecipes[k];
+                mapped[k.toLowerCase()] = { id: r.id || slugify(r.name), name: r.name || '', type: r.type ?? 'result' } as WordItem;
+              }
+              console.log('✅ Loaded', Object.keys(mapped).length, 'global recipes from Firestore');
+              setRecipesOverride(mapped);
+            } else {
+              console.log('⚠️ No global recipes found in Firestore, AI will generate on-the-fly');
+              setRecipesOverride(null);
+            }
+          } catch (err) {
+            console.log('⚠️ Failed to load Firestore recipes, using AI generation');
+            setRecipesOverride(null);
+          }
+        })();
       } catch (e) {
         console.error('❌ Error loading data:', e);
-        setDailyOverride(null);
+        // Still use local fallback if everything fails
+        const localPuzzle = pickDaily(dateISO);
+        setDailyOverride(localPuzzle);
         setRecipesOverride(null);
-        setIsLoading(false);
+        // Loading screen will auto-hide via useEffect when dailyOverride is set
       }
     }
     loadRemote();
@@ -351,6 +499,14 @@ export default function App() {
       return () => document.removeEventListener('visibilitychange', handleFocus);
     }
   }, []);
+
+  // Auto-hide loading screen when dailyOverride is set (prevent flickering)
+  useEffect(() => {
+    if (dailyOverride && isLoading) {
+      console.log('✅ Daily puzzle loaded, hiding loading screen');
+      setIsLoading(false);
+    }
+  }, [dailyOverride, isLoading]);
 
   const ensureInDiscovered = (item: WordItem) => {
     setDiscovered(prev => {
@@ -404,6 +560,102 @@ export default function App() {
     return null; // Will trigger AI recipe request in combineIfOverlapByUid
   };
 
+  // --- Selection-based mixing handlers ---
+  const selectionDisabled = (id: string): boolean => {
+    const lid = id.toLowerCase();
+    // If both A and B are selected, disable all words
+    if (currentA && currentB) return true;
+    // Disable if the item is already selected
+    if ((currentA && currentA === lid) || (currentB && currentB === lid)) return true;
+    // When A is set, disable any word that has already been combined with A today
+    if (currentA && usedCombos.has(comboKey(currentA, lid))) return true;
+    // Optionally, if B is set, also disable words already combined with B
+    if (currentB && usedCombos.has(comboKey(currentB, lid))) return true;
+    return false;
+  };
+
+  const onPickFromInventory = (item: WordItem) => {
+    const lid = item.id.toLowerCase();
+    if (!currentA) { 
+      setCurrentA(lid); 
+      setLastResult(null); // Clear result when selecting A
+      return; 
+    }
+    if (!currentB && lid !== currentA) { 
+      setCurrentB(lid); 
+      setLastResult(null); // Clear result when selecting B
+      return; 
+    }
+  };
+
+  const canMix = !!currentA && !!currentB && currentA !== currentB && !usedCombos.has(comboKey(currentA!, currentB!));
+
+  const onMix = async () => {
+    if (!canMix || !currentA || !currentB) return;
+    setIsCombining(true);
+    try {
+      // try global recipe first
+      const local = findRecipe(currentA, currentB);
+      let result: WordItem | null = local;
+      if (!result) {
+        // try AI
+        let fbConfig: any = undefined;
+        try { fbConfig = require('./firebase.config.json'); } catch (e) { fbConfig = undefined; }
+        // Call AI service - use environment variable or fallback
+        const AI_SERVICE_URL = process.env.EXPO_PUBLIC_AI_SERVICE_URL || 'http://127.0.0.1:8099';
+        const ai = await fetch(`${AI_SERVICE_URL}/combine`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ a: currentA, b: currentB })
+        }).then(res => res.ok ? res.json() : null);
+        if (ai) result = { id: ai.id, name: ai.name, type: ai.type } as WordItem;
+      }
+      const ts = Date.now();
+      if (result) {
+        ensureInDiscovered(result);
+        Alert.alert('Result', `${result.name}`);
+        setLastResult(result.name);
+        console.log('Saving history:', { a: currentA, b: currentB, resultId: result.id, resultName: result.name, ts, puzzleId: dateISO });
+        await appendHistory(dateISO, { a: currentA, b: currentB, resultId: result.id, resultName: result.name, ts, puzzleId: dateISO, synced: false });
+        // persist discovered list
+        try {
+          await setDiscoveredWords(dateISO, [{ id: result.id, name: result.name }, ...discovered.map(d => ({ id: d.id, name: d.name }))]);
+        } catch {}
+      } else {
+        // Shake animation for failed combination
+        Animated.sequence([
+          Animated.timing(shakeAnimation, { toValue: 10, duration: 50, useNativeDriver: true }),
+          Animated.timing(shakeAnimation, { toValue: -10, duration: 50, useNativeDriver: true }),
+          Animated.timing(shakeAnimation, { toValue: 10, duration: 50, useNativeDriver: true }),
+          Animated.timing(shakeAnimation, { toValue: -10, duration: 50, useNativeDriver: true }),
+          Animated.timing(shakeAnimation, { toValue: 0, duration: 50, useNativeDriver: true })
+        ]).start();
+        
+        setLastResult('❌ No Connection');
+        console.log('Saving history (no result):', { a: currentA, b: currentB, ts, puzzleId: dateISO });
+        await appendHistory(dateISO, { a: currentA, b: currentB, ts, puzzleId: dateISO, synced: false });
+      }
+      await addUsedCombo(dateISO, currentA, currentB);
+      setUsedCombos(prev => new Set(prev).add(comboKey(currentA, currentB)));
+      // clear both selections after mix
+      setCurrentA(null);
+      setCurrentB(null);
+      // background sync
+      console.log('🔄 Attempting to sync history, guestUserId:', guestUserId);
+      if (guestUserId) {
+        syncHistory(dateISO, guestUserId).catch((error) => {
+          console.error('❌ Failed to sync history:', error);
+        });
+      } else {
+        console.warn('⚠️  Guest user ID not available, skipping sync');
+      }
+    } catch (e) {
+      Alert.alert('Error', 'เกิดข้อผิดพลาดขณะผสม');
+    } finally {
+      setIsCombining(false);
+    }
+  };
+
   const combineIfOverlapByUid = async (uidA: number) => {
     setIsCombining(true);
     setPlaced(prev => {
@@ -423,7 +675,12 @@ export default function App() {
             try {
               let fbConfig: any = undefined;
               try { fbConfig = require('./firebase.config.json'); } catch (e) { fbConfig = undefined; }
-              const ai = await requestAIRecipe(dateISO, a.id, b.id, fbConfig);
+              const AI_SERVICE_URL = process.env.EXPO_PUBLIC_AI_SERVICE_URL || 'http://127.0.0.1:8099';
+              const ai = await fetch(`${AI_SERVICE_URL}/combine`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ a: a.id, b: b.id })
+              }).then(res => res.ok ? res.json() : null);
               if (!ai) return;
               const cxAI = (a.x + b.x) / 2; const cyAI = (a.y + b.y) / 2;
               ensureInDiscovered({ id: ai.id, name: ai.name, type: ai.type });
@@ -447,7 +704,23 @@ export default function App() {
         next.push({ uid, id: result.id, name: result.name, type: result.type, x: cx, y: cy, z: 99 });
         ensureInDiscovered(result);
         if (result.id === daily.goal.id) {
-          Alert.alert('สำเร็จ!', `คุณสร้าง ${daily.goal.name} ได้แล้ว!`);
+          console.log('🎉 Victory! Goal achieved:', daily.goal.name);
+          setHasWon(true);
+          // Save victory history to Firebase
+          setTimeout(async () => {
+            try {
+              const victoryHistory = await getHistory(dateISO);
+              console.log('💾 Saving victory history to Firebase:', victoryHistory.length, 'plays');
+              if (guestUserId && victoryHistory.length > 0) {
+                await syncHistory(dateISO, guestUserId);
+                console.log('✅ Victory history saved!');
+              }
+              setScreen('victory');
+            } catch (error) {
+              console.error('❌ Failed to save victory history:', error);
+              setScreen('victory'); // Go to victory screen anyway
+            }
+          }, 500);
         }
         setIsCombining(false);
         return next;
@@ -474,7 +747,12 @@ export default function App() {
             try {
               let fbConfig: any = undefined;
               try { fbConfig = require('./firebase.config.json'); } catch (e) { fbConfig = undefined; }
-              const ai = await requestAIRecipe(dateISO, dragItem.id, b.id, fbConfig);
+              const AI_SERVICE_URL = process.env.EXPO_PUBLIC_AI_SERVICE_URL || 'http://127.0.0.1:8099';
+              const ai = await fetch(`${AI_SERVICE_URL}/combine`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ a: dragItem.id, b: b.id })
+              }).then(res => res.ok ? res.json() : null);
               if (!ai) return;
               const cxAI = (x + b.x) / 2; const cyAI = (y + b.y) / 2;
               ensureInDiscovered({ id: ai.id, name: ai.name, type: ai.type });
@@ -494,7 +772,23 @@ export default function App() {
         next.push({ uid, id: result.id, name: result.name, type: result.type, x: cx, y: cy, z: 1 });
         ensureInDiscovered(result);
         if (result.id === daily.goal.id) {
-          Alert.alert('สำเร็จ!', `คุณสร้าง ${daily.goal.name} ได้แล้ว!`);
+          console.log('🎉 Victory! Goal achieved:', daily.goal.name);
+          setHasWon(true);
+          // Save victory history to Firebase
+          setTimeout(async () => {
+            try {
+              const victoryHistory = await getHistory(dateISO);
+              console.log('💾 Saving victory history to Firebase:', victoryHistory.length, 'plays');
+              if (guestUserId && victoryHistory.length > 0) {
+                await syncHistory(dateISO, guestUserId);
+                console.log('✅ Victory history saved!');
+              }
+              setScreen('victory');
+            } catch (error) {
+              console.error('❌ Failed to save victory history:', error);
+              setScreen('victory'); // Go to victory screen anyway
+            }
+          }, 500);
         }
         didCombine = true;
         return next;
@@ -651,6 +945,123 @@ export default function App() {
   // Home Screen rendering
   if (screen !== 'game') {
     const gameNo = getDailyNumber();
+    if (screen === 'history') {
+      console.log('Rendering history screen, isLoadingHistory:', isLoadingHistory, 'historyItems.length:', historyItems.length);
+      console.log('History screen is being rendered!');
+      return (
+        <SafeAreaView style={[styles.container, isDark ? stylesDark.container : stylesLight.container]}>
+          <View style={[styles.header, isDark ? stylesDark.header : stylesLight.header]}>
+            <View style={styles.headerRow}>
+              <TouchableOpacity style={styles.backBtn} onPress={() => setScreen('game')} hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}>
+                <Text style={[styles.backIcon, isDark ? stylesDark.backIcon : stylesLight.backIcon]} selectable={false}>‹</Text>
+              </TouchableOpacity>
+              <Text style={[styles.title, isDark ? stylesDark.title : stylesLight.title]} selectable={false}>HISTORY</Text>
+              <View style={styles.menuBtn} />
+            </View>
+          </View>
+          <ScrollView style={[styles.historyContent, isDark ? stylesDark.historyContent : stylesLight.historyContent]}>
+            {isLoadingHistory ? (
+              <View style={styles.historyLoadingContainer}>
+                <Text style={[styles.historyText, isDark ? stylesDark.historyText : stylesLight.historyText]}>
+                  🔄 Loading history...
+                </Text>
+              </View>
+            ) : historyItems.length === 0 ? (
+              <Text style={[styles.historyText, isDark ? stylesDark.historyText : stylesLight.historyText]}>
+                No combinations yet today.
+              </Text>
+            ) : (
+              <View style={styles.historyList}>
+                {historyItems.map((item, index) => (
+                  <View key={item.ts} style={[styles.historyItem, isDark ? stylesDark.historyItem : stylesLight.historyItem]}>
+                    <Text style={[styles.historyItemText, isDark ? stylesDark.historyItemText : stylesLight.historyItemText]}>
+                      {item.a} + {item.b} = {item.resultName || '?'}
+                    </Text>
+                    <Text style={[styles.historyItemTime, isDark ? stylesDark.historyItemTime : stylesLight.historyItemTime]}>
+                      {new Date(item.ts).toLocaleTimeString()}
+                    </Text>
+                  </View>
+                ))}
+              </View>
+            )}
+          </ScrollView>
+        </SafeAreaView>
+      );
+    }
+    if (screen === 'victory') {
+      return (
+        <SafeAreaView style={[styles.container, isDark ? stylesDark.container : stylesLight.container]}>
+          <View style={[styles.header, isDark ? stylesDark.header : stylesLight.header]}>
+            <View style={styles.headerRow}>
+              <TouchableOpacity style={styles.backBtn} onPress={() => setScreen('home')} hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}>
+                <Text style={[styles.backIcon, isDark ? stylesDark.backIcon : stylesLight.backIcon]} selectable={false}>‹</Text>
+              </TouchableOpacity>
+              <Text style={[styles.title, isDark ? stylesDark.title : stylesLight.title]} selectable={false}>VICTORY!</Text>
+              <View style={styles.menuBtn} />
+            </View>
+          </View>
+          <ScrollView style={[styles.historyContent, isDark ? stylesDark.historyContent : stylesLight.historyContent]}>
+            <View style={styles.victoryContainer}>
+              <Text style={[styles.victoryTitle, isDark ? stylesDark.victoryTitle : stylesLight.victoryTitle]}>
+                🎉 Congratulations! 🎉
+              </Text>
+              <Text style={[styles.victorySubtitle, isDark ? stylesDark.victorySubtitle : stylesLight.victorySubtitle]}>
+                You found: <Text style={styles.victoryGoalName}>{daily.goal.name}</Text>
+              </Text>
+              
+              <View style={[styles.statsBox, isDark ? stylesDark.statsBox : stylesLight.statsBox]}>
+                <Text style={[styles.statsTitle, isDark ? stylesDark.statsTitle : stylesLight.statsTitle]}>
+                  📊 Your Journey
+                </Text>
+                <Text style={[styles.statsText, isDark ? stylesDark.statsText : stylesLight.statsText]}>
+                  Total Combinations: {historyItems.length}
+                </Text>
+                <Text style={[styles.statsText, isDark ? stylesDark.statsText : stylesLight.statsText]}>
+                  Words Discovered: {discovered.length}
+                </Text>
+              </View>
+
+              <View style={[styles.historyBox, isDark ? stylesDark.historyBox : stylesLight.historyBox]}>
+                <Text style={[styles.historyBoxTitle, isDark ? stylesDark.historyBoxTitle : stylesLight.historyBoxTitle]}>
+                  🧩 Your Combinations
+                </Text>
+                {isLoadingHistory ? (
+                  <Text style={[styles.historyText, isDark ? stylesDark.historyText : stylesLight.historyText]}>
+                    Loading...
+                  </Text>
+                ) : historyItems.length === 0 ? (
+                  <Text style={[styles.historyText, isDark ? stylesDark.historyText : stylesLight.historyText]}>
+                    No combinations recorded.
+                  </Text>
+                ) : (
+                  <View style={styles.historyList}>
+                    {historyItems.map((item, index) => (
+                      <View key={item.ts} style={[styles.historyItem, isDark ? stylesDark.historyItem : stylesLight.historyItem]}>
+                        <Text style={[styles.historyItemText, isDark ? stylesDark.historyItemText : stylesLight.historyItemText]}>
+                          {item.a} + {item.b} = {item.resultName || '?'}
+                        </Text>
+                        <Text style={[styles.historyItemTime, isDark ? stylesDark.historyItemTime : stylesLight.historyItemTime]}>
+                          {new Date(item.ts).toLocaleTimeString()}
+                        </Text>
+                      </View>
+                    ))}
+                  </View>
+                )}
+              </View>
+
+              <TouchableOpacity 
+                style={[styles.victoryButton, isDark ? stylesDark.victoryButton : stylesLight.victoryButton]}
+                onPress={() => setScreen('home')}
+              >
+                <Text style={[styles.victoryButtonText, isDark ? stylesDark.victoryButtonText : stylesLight.victoryButtonText]}>
+                  Back to Home
+                </Text>
+              </TouchableOpacity>
+            </View>
+          </ScrollView>
+        </SafeAreaView>
+      );
+    }
     if (screen === 'settings') {
       return (
         <SafeAreaView style={[homeStyles.container, isDark ? homeStylesDark.container : homeStylesLight.container]}>
@@ -683,6 +1094,11 @@ export default function App() {
         </SafeAreaView>
       );
     }
+    
+    // Check if player has started playing today (discovered more than just start words)
+    const hasStartedPlaying = discovered.length > daily.startWords.length;
+    const buttonText = hasStartedPlaying ? 'Continue' : 'Play';
+
     return (
       <SafeAreaView style={[homeStyles.container, isDark ? homeStylesDark.container : homeStylesLight.container]}>
         <View style={homeStyles.headerSpace} />
@@ -692,16 +1108,18 @@ export default function App() {
           <View style={[homeStyles.card, isDark ? homeStylesDark.card : homeStylesLight.card]}>
             <Text style={[homeStyles.cardLabel, isDark ? homeStylesDark.cardLabel : homeStylesLight.cardLabel]} selectable={false}>Today's game:</Text>
             <Text style={[homeStyles.cardNumber, isDark ? homeStylesDark.cardNumber : homeStylesLight.cardNumber]} selectable={false}>#{gameNo}</Text>
-            <Text style={[homeStyles.cardLabel, isDark ? homeStylesDark.cardLabel : homeStylesLight.cardLabel]} selectable={false}>
-              {getTodayISO()} (epoch {getEpochISO()})
-            </Text>
             <TouchableOpacity style={[homeStyles.primaryBtn, isDark ? homeStylesDark.primaryBtn : homeStylesLight.primaryBtn]} onPress={() => setScreen('game')}>
-              <Text style={[homeStyles.primaryBtnText, isDark ? homeStylesDark.primaryBtnText : homeStylesLight.primaryBtnText]} selectable={false}>Continue</Text>
+              <Text style={[homeStyles.primaryBtnText, isDark ? homeStylesDark.primaryBtnText : homeStylesLight.primaryBtnText]} selectable={false}>{buttonText}</Text>
             </TouchableOpacity>
           </View>
 
           <View style={homeStyles.menu}>
-            <TouchableOpacity style={[homeStyles.menuItem, isDark ? homeStylesDark.menuItem : homeStylesLight.menuItem]} onPress={() => setScreen('history')}>
+            <TouchableOpacity style={[homeStyles.menuItem, isDark ? homeStylesDark.menuItem : homeStylesLight.menuItem]} onPress={() => {
+              console.log('Home History button pressed, current dateISO:', dateISO);
+              console.log('Setting screen to history...');
+              setScreen('history');
+              console.log('Screen set to history');
+            }}>
               <Text style={[homeStyles.menuText, isDark ? homeStylesDark.menuText : homeStylesLight.menuText]} selectable={false}>Previous games</Text>
             </TouchableOpacity>
             <TouchableOpacity style={[homeStyles.menuItem, isDark ? homeStylesDark.menuItem : homeStylesLight.menuItem]} onPress={() => setScreen('howto')}>
@@ -715,6 +1133,7 @@ export default function App() {
       </SafeAreaView>
     );
   }
+
 
   // Show loading screen until data is loaded
   if (isLoading) {
@@ -758,58 +1177,43 @@ export default function App() {
             <TouchableOpacity style={styles.menuItemRow} onPress={onGiveUp}>
               <Text style={[styles.menuItemText, isDark ? stylesDark.menuItemText : stylesLight.menuItemText]} selectable={false}>Give up</Text>
             </TouchableOpacity>
+            <TouchableOpacity style={styles.menuItemRow} onPress={() => {
+              console.log('Game menu History button pressed, current dateISO:', dateISO);
+              setMenuOpen(false);
+              setScreen('history');
+            }}>
+              <Text style={[styles.menuItemText, isDark ? stylesDark.menuItemText : stylesLight.menuItemText]} selectable={false}>History</Text>
+            </TouchableOpacity>
+            <TouchableOpacity style={styles.menuItemRow} onPress={async () => {
+              try {
+                await clearAllForPuzzle(dateISO);
+                const used = await getUsedCombos(dateISO);
+                setUsedCombos(used);
+                setCurrentA(null);
+                setCurrentB(null);
+                // reset discovered (remove results of today) to only today's start words
+                const uniqueStarts = daily.startWords.filter((w, i, self) => i === self.findIndex(x => x.id === w.id));
+                setDiscovered(uniqueStarts);
+                setLastResult(null);
+                Alert.alert('Cleared', 'ลบประวัติและคอมโบที่ใช้แล้วของวันนี้เรียบร้อย');
+                setMenuOpen(false);
+              } catch (e) {
+                Alert.alert('Error', 'ลบข้อมูลไม่สำเร็จ');
+              }
+            }}>
+              <Text style={[styles.menuItemText, isDark ? stylesDark.menuItemText : stylesLight.menuItemText]} selectable={false}>Clear today data</Text>
+            </TouchableOpacity>
           </View>
         )}
       </View>
-      <View style={[styles.content, isStacked && styles.contentColumn]}>
-        <View style={styles.leftPane}>
-          <View
-            style={[styles.canvas, isDark ? stylesDark.canvas : stylesLight.canvas]}
-            ref={canvasRef}
-            onLayout={onCanvasLayout}
-          >
-            {placed.map((p) => {
-              const pan = makeDraggable(p.uid);
-              return (
-                <View
-                  key={p.uid}
-                  style={[styles.itemBubble, { left: p.x, top: p.y, zIndex: p.z }]}
-                  {...pan.panHandlers}
-                >
-                  <Text style={styles.itemText} selectable={false} numberOfLines={1} ellipsizeMode="tail">{p.name}</Text>
-                </View>
-              );
-            })}
-          </View>
-          
-          {/* Combining Overlay */}
-          {isCombining && (
-            <View style={[styles.loadingOverlay, isDark ? stylesDark.loadingOverlay : stylesLight.loadingOverlay]}>
-              <View style={[styles.loadingContent, isDark ? stylesDark.loadingContent : stylesLight.loadingContent]}>
-                <Text style={[styles.loadingText, isDark ? stylesDark.loadingText : stylesLight.loadingText]}>
-                  🔄 Combining...
-                </Text>
-                <Text style={[styles.loadingSubtext, isDark ? stylesDark.loadingSubtext : stylesLight.loadingSubtext]}>
-                  Creating new recipe
-                </Text>
-              </View>
-            </View>
-          )}
-          
-          <TouchableOpacity style={[styles.button, isDark ? stylesDark.button : stylesLight.button]} onPress={() => setPlaced([])}> 
-            <Text style={[styles.buttonText, isDark ? stylesDark.buttonText : stylesLight.buttonText]} selectable={false}>Clear</Text>
-          </TouchableOpacity>
+      {/* Persistent Inventory Dock (moved to top) */}
+      <View style={styles.inventoryDock} accessibilityLabel="inventory-dock" testID="inventory-dock">
+        <View style={styles.inventoryHeaderRow} accessibilityLabel="inventory-header" testID="inventory-header">
+          <Text style={[styles.sheetTitle, isDark ? stylesDark.sheetTitle : stylesLight.sheetTitle]} selectable={false} accessibilityLabel="inventory-title" testID="inventory-title">Word</Text>
+          <Text style={[styles.sheetClose, isDark ? stylesDark.sheetClose : stylesLight.sheetClose]} selectable={false} accessibilityLabel="inventory-count" testID="inventory-count">{filteredAll.length} items</Text>
         </View>
-        {/* right pane removed */}
-      </View>
-      {/* Persistent Inventory Dock (always open) */}
-      <View style={styles.inventoryDock}>
-        <View style={styles.inventoryHeaderRow}>
-          <Text style={[styles.sheetTitle, isDark ? stylesDark.sheetTitle : stylesLight.sheetTitle]} selectable={false}>Word</Text>
-          <Text style={[styles.sheetClose, isDark ? stylesDark.sheetClose : stylesLight.sheetClose]} selectable={false}>{filteredAll.length} items</Text>
-        </View>
-        <View style={[styles.searchContainer, isDark ? stylesDark.searchContainer : stylesLight.searchContainer]}>
-          <Text style={[styles.searchIcon, isDark ? stylesDark.searchIcon : stylesLight.searchIcon]} selectable={false}>🔍</Text>
+        <View style={[styles.searchContainer, isDark ? stylesDark.searchContainer : stylesLight.searchContainer]} accessibilityLabel="search-container" testID="search-container">
+          <Text style={[styles.searchIcon, isDark ? stylesDark.searchIcon : stylesLight.searchIcon]} selectable={false} accessibilityLabel="search-icon" testID="search-icon">🔍</Text>
           <TextInput
             style={[styles.searchInput, isDark ? stylesDark.searchInput : stylesLight.searchInput]}
             placeholder="Search words..."
@@ -820,28 +1224,16 @@ export default function App() {
             autoCorrect={false}
             value={searchQuery}
             onChangeText={(t) => setSearchQuery(t.replace(/[^a-z]/gi, ''))}
+            accessibilityLabel="search-input"
+            testID="search-input"
           />
           {searchQuery.length > 0 && (
-            <TouchableOpacity onPress={() => setSearchQuery('')}>
+            <TouchableOpacity onPress={() => setSearchQuery('')} accessibilityLabel="search-clear" testID="search-clear">
               <Text style={[styles.searchClear, isDark ? stylesDark.searchClear : stylesLight.searchClear]} selectable={false}>✕</Text>
             </TouchableOpacity>
           )}
         </View>
-        <ScrollView horizontal showsHorizontalScrollIndicator contentContainerStyle={styles.inventoryWrapHorizontal}>
-          {tabItems.map((item, index) => {
-            const isFav = favorites.includes(item.id);
-            return (
-              <View key={`${item.id}-${index}`} style={styles.inventoryItemWrapper}> 
-                <TouchableOpacity onPress={() => { spawnOnCanvas(item); ensureInDiscovered(item); pushRecent(item.id); }}>
-                  <View style={[styles.item, item.type === 'start' && styles.itemStart, item.id === daily.goal.id && styles.itemGoal]}>
-                    <Text selectable={false} numberOfLines={1} ellipsizeMode="tail">{item.name}</Text>
-                  </View>
-                </TouchableOpacity>
-              </View>
-            );
-          })}
-        </ScrollView>
-        <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={[styles.tabRow]}>
+        <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={[styles.tabRow]} accessibilityLabel="tab-scroll" testID="tab-scroll">
           {(['all','recent'] as TabKey[]).map(t => (
             <TouchableOpacity
               key={t}
@@ -850,6 +1242,8 @@ export default function App() {
                 setActiveTab(t);
                 if (t === 'all') setInvFilter(null);
               }}
+              accessibilityLabel={`tab-${t}`}
+              testID={`tab-${t}`}
             >
               <Text style={isDark ? stylesDark.alphaText : stylesLight.alphaText} selectable={false}>{t === 'all' ? 'All' : 'Recent'}</Text>
             </TouchableOpacity>
@@ -857,13 +1251,108 @@ export default function App() {
           {letterKeys.length > 0 && (
             <>
               {letterKeys.map(ch => (
-                <TouchableOpacity key={ch} style={[styles.alphaChip, isDark ? stylesDark.alphaChip : stylesLight.alphaChip]} onPress={() => setInvFilter(ch)}>
+                <TouchableOpacity key={ch} style={[styles.alphaChip, isDark ? stylesDark.alphaChip : stylesLight.alphaChip]} onPress={() => setInvFilter(ch)} accessibilityLabel={`alpha-${ch}`} testID={`alpha-${ch}`}>
                   <Text style={isDark ? stylesDark.alphaText : stylesLight.alphaText} selectable={false}>{ch}</Text>
                 </TouchableOpacity>
               ))}
             </>
           )}
         </ScrollView>
+        <ScrollView showsVerticalScrollIndicator contentContainerStyle={[styles.inventoryWrapVertical, { height: 'calc(100vh - 575px)' as any }]} accessibilityLabel="inventory-scroll" testID="inventory-scroll">
+          {tabItems.map((item, index) => {
+            const isFav = favorites.includes(item.id);
+            const disabled = selectionDisabled(item.id);
+            return (
+              <View key={`${item.id}-${index}`} style={styles.inventoryItemWrapper} accessibilityLabel={`inventory-item-${item.id}`} testID={`inventory-item-${item.id}`}> 
+                <TouchableOpacity disabled={disabled} onPress={() => { onPickFromInventory(item); ensureInDiscovered(item); pushRecent(item.id); }} accessibilityLabel={`word-${item.id}`} testID={`word-${item.id}`}>
+                  <View style={[styles.item, item.type === 'start' && styles.itemStart, item.id === daily.goal.id && styles.itemGoal, disabled && { opacity: 0.4 }]}> 
+                    <Text selectable={false} numberOfLines={1} ellipsizeMode="tail">{item.name}</Text>
+                  </View>
+                </TouchableOpacity>
+              </View>
+            );
+          })}
+        </ScrollView>
+      </View>
+      {/* End Inventory Dock */}
+      <View style={[styles.content, isStacked && styles.contentColumn, { height: 'auto', bottom: BANNER_HEIGHT }]} accessibilityLabel="mixing-section" testID="mixing-section">
+        <View style={styles.leftPane}>
+          <View style={{ justifyContent: 'center', paddingHorizontal: 0, gap: 8 }}>
+            {/* Line 1: A + B */}
+            <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
+              {/* Box A */}
+              <View style={{ flex: 1 }} accessibilityLabel="selection-a-container" testID="selection-a-container">
+                <TouchableOpacity onPress={() => { if (currentA) { setCurrentA(null); setLastResult(null); } }} activeOpacity={0.8} accessibilityLabel="selection-a-button" testID="selection-a-button">
+                  <View style={[styles.selectionBox, !currentA && styles.selectionBoxPlaceholder]} accessibilityLabel="selection-a-box" testID="selection-a-box">
+                    <Text
+                      selectable={false}
+                      numberOfLines={1}
+                      ellipsizeMode="tail"
+                      adjustsFontSizeToFit
+                      minimumFontScale={0.1}
+                      style={[styles.selectionText, !currentA && styles.placeholderText]}
+                    >
+                      {currentA ? (filteredAll.find(w => w.id.toLowerCase() === currentA)?.name || currentA) : 'A'}
+                    </Text>
+                  </View>
+                </TouchableOpacity>
+              </View>
+
+              {/* + */}
+              <Text selectable={false} style={{ fontSize: 14, fontWeight: '800' }}>+</Text>
+
+              {/* Box B */}
+              <View style={{ flex: 1 }} accessibilityLabel="selection-b-container" testID="selection-b-container">
+                <TouchableOpacity onPress={() => { if (currentB) { setCurrentB(null); setLastResult(null); } }} activeOpacity={0.8} accessibilityLabel="selection-b-button" testID="selection-b-button">
+                  <View style={[styles.selectionBox, !currentB && styles.selectionBoxPlaceholder]} accessibilityLabel="selection-b-box" testID="selection-b-box">
+                    <Text
+                      selectable={false}
+                      numberOfLines={1}
+                      ellipsizeMode="tail"
+                      adjustsFontSizeToFit
+                      minimumFontScale={0.1}
+                      style={[styles.selectionText, !currentB && styles.placeholderText]}
+                    >
+                      {currentB ? (filteredAll.find(w => w.id.toLowerCase() === currentB)?.name || currentB) : 'B'}
+                    </Text>
+                  </View>
+                </TouchableOpacity>
+              </View>
+            </View>
+
+            {/* Line 2: = */}
+            <View style={{ alignItems: 'center', justifyContent: 'center' }}>
+              <Text selectable={false} style={{ fontSize: 14, fontWeight: '800' }}>=</Text>
+            </View>
+            {/* Line 3: Result */}
+            <Animated.View 
+              accessibilityLabel="result-container" 
+              testID="result-container"
+              style={{ transform: [{ translateX: shakeAnimation }] }}
+            >
+              <View style={[styles.resultBox, !lastResult && styles.resultBoxPlaceholder]} accessibilityLabel="result-box" testID="result-box">
+                <Text
+                  selectable={false}
+                  numberOfLines={1}
+                  ellipsizeMode="tail"
+                  adjustsFontSizeToFit
+                  minimumFontScale={0.2}
+                  style={[styles.resultText, !lastResult && styles.resultPlaceholderText]}
+                >
+                  {lastResult ? lastResult : 'Result'}
+                </Text>
+              </View>
+            </Animated.View>
+            {/* Line 4: Mix button */}
+            <TouchableOpacity disabled={!canMix || isCombining} onPress={onMix} accessibilityLabel="mix-button" testID="mix-button">
+              <View style={[styles.fullButton, { backgroundColor: (canMix && !isCombining) ? '#111827' : '#9ca3af' }]} accessibilityLabel="mix-button-container" testID="mix-button-container"> 
+                <Text selectable={false} style={{ color: '#ffffff', fontWeight: '700', fontSize: 14 }}>{isCombining ? 'Mixing...' : 'Mix'}</Text>
+              </View>
+            </TouchableOpacity>
+            {/* per-button loading removed; use full-screen overlay below */}
+          </View>
+        </View>
+        {/* right pane removed */}
       </View>
       <View style={[styles.banner, isDark ? stylesDark.banner : stylesLight.banner]}>
         {/* AdMobBanner disabled for web compatibility */}
@@ -871,13 +1360,20 @@ export default function App() {
           AdMobBanner component not supported on the web
         </Text>
       </View>
+      {isCombining && (
+        <View style={[styles.loadingOverlay, isDark ? stylesDark.loadingOverlay : stylesLight.loadingOverlay]}>
+          <View style={[styles.loadingContent, isDark ? stylesDark.loadingContent : stylesLight.loadingContent]}>
+            <Text style={[styles.loadingText, isDark ? stylesDark.loadingText : stylesLight.loadingText]}>🔄 Mixing...</Text>
+          </View>
+        </View>
+      )}
     </SafeAreaView>
   );
 }
 
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: '#0f1222', userSelect: 'none' as any, cursor: 'default' as any },
-  header: { paddingHorizontal: 16, paddingVertical: 16, minHeight: 64, borderBottomWidth: StyleSheet.hairlineWidth, borderBottomColor: 'rgba(255,255,255,0.15)' },
+  header: { paddingHorizontal: 16, paddingVertical: 16, minHeight: 64, borderBottomWidth: StyleSheet.hairlineWidth, borderBottomColor: 'rgba(255,255,255,0.15)', zIndex: 9 },
   headerRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
   title: { color: '#eef1ff', fontSize: 20, fontWeight: '800', textTransform: 'uppercase' as any },
   goal: { color: '#a8b0d4', marginTop: 6 },
@@ -890,19 +1386,19 @@ const styles = StyleSheet.create({
   backIcon: { color: '#a8b0d4', fontSize: 26, lineHeight: 26 },
   menuBtn: { width: 44, height: 44, alignItems: 'center', justifyContent: 'center' },
   menuIcon: { color: '#a8b0d4', fontSize: 26, lineHeight: 26 },
-  menuPanel: { position: 'absolute', right: 12, top: 44, backgroundColor: '#1a1e33', borderRadius: 10, borderWidth: StyleSheet.hairlineWidth, borderColor: 'rgba(255,255,255,0.15)', overflow: 'hidden' },
+  menuPanel: { position: 'absolute', right: 12, top: 44, backgroundColor: '#1a1e33', borderRadius: 10, borderWidth: StyleSheet.hairlineWidth, borderColor: 'rgba(255,255,255,0.15)', overflow: 'hidden', zIndex: 100000 },
   menuItemRow: { paddingHorizontal: 12, paddingVertical: 10 },
   menuItemText: { color: '#eef1ff' },
-  content: { flex: 1, flexDirection: 'row' },
+  content: { position: 'absolute', bottom: 0, left: 0, right: 0, width: '100%', flexDirection: 'row', zIndex: 10 },
   contentColumn: { flexDirection: 'column' },
-  leftPane: { flex: 1, padding: 12, position: 'relative', zIndex: 2 },
+  leftPane: { flex: 1, padding: 16, position: 'relative', zIndex: 2 },
   rightPane: { width: 0, padding: 0, borderLeftWidth: 0, borderLeftColor: 'transparent', position: 'relative', zIndex: 1 },
   rightPaneFull: { width: 0, borderLeftWidth: 0, borderTopWidth: 0, borderTopColor: 'transparent' },
   controlsRow: { flexDirection: 'row', gap: 8, marginBottom: 8 },
   chip: { backgroundColor: 'rgba(255,255,255,0.08)', paddingHorizontal: 10, paddingVertical: 6, borderRadius: 999 },
   inventoryScroll: { },
   inventoryWrap: { flexDirection: 'row', flexWrap: 'wrap', gap: 8 },
-  inventoryItemWrapper: { height: 48, marginRight: 8, justifyContent: 'center' },
+  inventoryItemWrapper: { justifyContent: 'center' },
   item: { backgroundColor: '#fff', height: 36, paddingHorizontal: 10, borderRadius: 10, alignItems: 'center', justifyContent: 'center', alignSelf: 'flex-start', userSelect: 'none' as any, cursor: 'default' as any },
   itemStart: { borderWidth: 2, borderColor: 'gold' },
   itemGoal: { borderWidth: 2, borderColor: '#7affb2' },
@@ -913,14 +1409,30 @@ const styles = StyleSheet.create({
   itemText: { color: '#101226', flexShrink: 1 },
   dragGhost: { position: 'absolute', backgroundColor: '#fff', paddingHorizontal: 12, paddingVertical: 10, borderRadius: 12, borderColor: 'rgba(0,0,0,0.08)', borderWidth: 1, opacity: 0.95, zIndex: 9999, elevation: 10, userSelect: 'none' as any, cursor: 'default' as any },
   dragGhostOverlay: { position: 'absolute', backgroundColor: '#fff', paddingHorizontal: 12, paddingVertical: 10, borderRadius: 12, borderColor: 'rgba(0,0,0,0.08)', borderWidth: 1, opacity: 0.95, zIndex: 99999, elevation: 20, userSelect: 'none' as any, cursor: 'default' as any, left: 0, top: 0 },
-  banner: { borderTopWidth: StyleSheet.hairlineWidth, borderTopColor: 'rgba(255,255,255,0.12)' },
+  banner: { position: 'absolute', bottom: 0, left: 0, right: 0, width: '100%', height: 40, borderTopWidth: StyleSheet.hairlineWidth, borderTopColor: 'rgba(255,255,255,0.12)', backgroundColor: '#0f1222', justifyContent: 'center', zIndex: 5 },
   bannerText: { color: '#a8b0d4', textAlign: 'center', paddingVertical: 8, fontSize: 12 },
   loadingOverlay: { position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: 'rgba(0,0,0,0.8)', zIndex: 1000, justifyContent: 'center', alignItems: 'center' },
   loadingContent: { backgroundColor: 'rgba(255,255,255,0.95)', padding: 24, borderRadius: 16, alignItems: 'center', minWidth: 200 },
   loadingText: { fontSize: 18, fontWeight: '600', marginBottom: 8, color: '#1f2937' },
   loadingSubtext: { fontSize: 14, color: '#6b7280', textAlign: 'center' },
+  selectionBox: { width: '100%', borderWidth: 2, borderStyle: 'dashed' as any, borderColor: '#111827', alignItems: 'center', justifyContent: 'center', paddingHorizontal: 16, paddingVertical: 12 },
+  selectionText: { fontSize: 14, color: 'rgba(0,0,0,0.7)' },
+  selectionBoxPlaceholder: { borderColor: 'rgba(0,0,0,0.25)' },
+  placeholderText: { color: 'rgba(0,0,0,0.35)' },
+  fullButton: { width: '100%', alignItems: 'center', justifyContent: 'center', borderRadius: 8, height: 44, marginTop: 8 },
+  resultBox: { width: '100%', borderWidth: 1, borderColor: 'rgba(0,0,0,0.2)', borderRadius: 12, alignItems: 'center', justifyContent: 'center', paddingHorizontal: 16, paddingVertical: 10 },
+  resultBoxPlaceholder: { borderColor: 'rgba(0,0,0,0.15)' },
+  resultText: { fontSize: 14, color: '#1f2937' },
+  resultPlaceholderText: { color: 'rgba(0,0,0,0.45)' },
+  historyText: { color: '#a8b0d4', fontSize: 16, textAlign: 'center', marginTop: 40, paddingHorizontal: 24 },
+  historyContent: { flex: 1, flexDirection: 'column' },
+  historyList: { padding: 16 },
+  historyLoadingContainer: { flex: 1, justifyContent: 'center', alignItems: 'center', paddingTop: 40 },
+  historyItem: { backgroundColor: 'rgba(255,255,255,0.05)', padding: 12, marginBottom: 8, borderRadius: 8, borderWidth: 1, borderColor: 'rgba(255,255,255,0.1)' },
+  historyItemText: { color: '#eef1ff', fontSize: 16, fontWeight: '600', marginBottom: 4 },
+  historyItemTime: { color: '#a8b0d4', fontSize: 12 },
   // Persistent Inventory Dock styles
-  inventoryDock: { paddingTop: 6, paddingHorizontal: 12, paddingBottom: 10, borderTopLeftRadius: 0, borderTopRightRadius: 0, borderTopWidth: 0, borderTopColor: 'transparent' },
+  inventoryDock: { padding: 16, paddingHorizontal: 12, borderTopLeftRadius: 0, borderTopRightRadius: 0, borderTopWidth: 0, borderTopColor: 'transparent', borderBottomWidth: 1, borderBottomColor: 'rgba(0,0,0,0.1)' },
   inventoryHeaderRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 },
   sheetTitle: { color: '#eef1ff', fontWeight: '800', fontSize: 16 },
   sheetClose: { color: '#a8b0d4' },
@@ -929,17 +1441,30 @@ const styles = StyleSheet.create({
   searchInput: { flex: 1, color: '#eef1ff', height: 44, paddingVertical: 10, fontSize: 16, lineHeight: 24 },
   searchClear: { color: '#a8b0d4', fontSize: 14, paddingHorizontal: 6, paddingVertical: 2 },
   tabRow: { flexDirection: 'row', alignItems: 'center', gap: 8, marginBottom: 8 },
-  tabChip: { backgroundColor: '#22283f', paddingHorizontal: 10, paddingVertical: 6, borderRadius: 999, height: 28, justifyContent: 'center' },
+  tabChip: { backgroundColor: '#22283f', paddingHorizontal: 16, paddingVertical: 10, borderRadius: 8, height: 40, justifyContent: 'center' },
   tabChipActive: { },
   alphaRow: { gap: 6, paddingBottom: 8 },
-  alphaChip: { backgroundColor: '#22283f', paddingHorizontal: 8, paddingVertical: 6, borderRadius: 8, height: 28, justifyContent: 'center' },
+  alphaChip: { backgroundColor: '#22283f', paddingHorizontal: 12, paddingVertical: 8, borderRadius: 8, height: 40, justifyContent: 'center' },
   alphaChipActive: { },
-  alphaText: { color: '#eef1ff' },
+  alphaText: { color: '#eef1ff', fontSize: 16 },
   radioRow: { flexDirection: 'row', gap: 8, marginTop: 8 },
   radioChip: { paddingHorizontal: 12, paddingVertical: 8, borderRadius: 999, borderWidth: 1 },
   inventoryWrapHorizontal: { flexDirection: 'row', flexWrap: 'nowrap', alignItems: 'center', paddingBottom: 4, height: 48 },
+  inventoryWrapVertical: { flexDirection: 'row', flexWrap: 'wrap', alignItems: 'center', paddingBottom: 4, gap: 8 },
   sheetPeek: { position: 'absolute', left: 0, right: 0, bottom: 0, alignItems: 'center', paddingVertical: 6, zIndex: 9997 },
-  sheetSwipeZone: { position: 'absolute', left: 0, right: 0, bottom: 0, height: 28, zIndex: 9996 }
+  sheetSwipeZone: { position: 'absolute', left: 0, right: 0, bottom: 0, height: 28, zIndex: 9996 },
+  // Victory screen styles
+  victoryContainer: { flex: 1, padding: 24, alignItems: 'center' },
+  victoryTitle: { fontSize: 32, fontWeight: '800', color: '#7affb2', textAlign: 'center', marginTop: 20, marginBottom: 12 },
+  victorySubtitle: { fontSize: 18, color: '#a8b0d4', textAlign: 'center', marginBottom: 24 },
+  victoryGoalName: { color: '#7affb2', fontWeight: '800', fontSize: 20 },
+  statsBox: { width: '100%', backgroundColor: 'rgba(122,255,178,0.08)', padding: 20, borderRadius: 16, borderWidth: 1, borderColor: 'rgba(122,255,178,0.25)', marginBottom: 20 },
+  statsTitle: { fontSize: 18, fontWeight: '700', color: '#7affb2', marginBottom: 12, textAlign: 'center' },
+  statsText: { fontSize: 16, color: '#eef1ff', marginBottom: 6, textAlign: 'center' },
+  historyBox: { width: '100%', backgroundColor: 'rgba(255,255,255,0.05)', padding: 16, borderRadius: 16, borderWidth: 1, borderColor: 'rgba(255,255,255,0.1)', marginBottom: 20, maxHeight: 400 },
+  historyBoxTitle: { fontSize: 18, fontWeight: '700', color: '#eef1ff', marginBottom: 12, textAlign: 'center' },
+  victoryButton: { width: '100%', backgroundColor: '#7affb2', paddingVertical: 16, borderRadius: 12, alignItems: 'center', marginTop: 10 },
+  victoryButtonText: { color: '#0f1222', fontSize: 18, fontWeight: '800', textTransform: 'uppercase' as any }
 });
 
 // Light/Dark overrides
@@ -957,6 +1482,11 @@ const stylesDark = StyleSheet.create({
   menuPanel: { backgroundColor: '#1a1e33', borderColor: 'rgba(255,255,255,0.15)' },
   menuItemText: { color: '#eef1ff' },
   canvas: { borderColor: 'rgba(255,255,255,0.12)' },
+  historyText: { color: '#a8b0d4' },
+  historyContent: { flexDirection: 'column' },
+  historyItem: { backgroundColor: 'rgba(255,255,255,0.05)', borderColor: 'rgba(255,255,255,0.1)' },
+  historyItemText: { color: '#eef1ff' },
+  historyItemTime: { color: '#a8b0d4' },
   sheetTitle: { color: '#eef1ff' },
   sheetClose: { color: '#a8b0d4' },
   searchContainer: { backgroundColor: 'rgba(255,255,255,0.08)' },
@@ -968,12 +1498,23 @@ const stylesDark = StyleSheet.create({
   alphaText: { color: '#eef1ff' },
   radioChip: { backgroundColor: '#22283f', borderColor: 'transparent' },
   radioChipActive: { borderColor: '#7affb2' },
-  banner: { borderTopColor: 'rgba(255,255,255,0.12)' },
+  banner: { borderTopColor: 'rgba(255,255,255,0.12)', backgroundColor: '#0f1222' },
   bannerText: { color: '#a8b0d4' },
   loadingOverlay: { backgroundColor: 'rgba(0,0,0,0.9)' },
   loadingContent: { backgroundColor: 'rgba(30,30,30,0.95)' },
   loadingText: { color: '#eef1ff' },
   loadingSubtext: { color: '#a8b0d4' },
+  // Victory screen overrides
+  victoryTitle: { color: '#7affb2' },
+  victorySubtitle: { color: '#a8b0d4' },
+  victoryGoalName: { color: '#7affb2' },
+  statsBox: { backgroundColor: 'rgba(122,255,178,0.08)', borderColor: 'rgba(122,255,178,0.25)' },
+  statsTitle: { color: '#7affb2' },
+  statsText: { color: '#eef1ff' },
+  historyBox: { backgroundColor: 'rgba(255,255,255,0.05)', borderColor: 'rgba(255,255,255,0.1)' },
+  historyBoxTitle: { color: '#eef1ff' },
+  victoryButton: { backgroundColor: '#7affb2' },
+  victoryButtonText: { color: '#0f1222' },
 });
 
 const stylesLight = StyleSheet.create({
@@ -990,6 +1531,11 @@ const stylesLight = StyleSheet.create({
   menuPanel: { backgroundColor: '#ffffff', borderColor: 'rgba(0,0,0,0.12)' },
   menuItemText: { color: '#1f2937' },
   canvas: { borderColor: 'rgba(0,0,0,0.12)' },
+  historyText: { color: '#6b7280' },
+  historyContent: { flexDirection: 'column' },
+  historyItem: { backgroundColor: 'rgba(0,0,0,0.05)', borderColor: 'rgba(0,0,0,0.1)' },
+  historyItemText: { color: '#1f2937' },
+  historyItemTime: { color: '#6b7280' },
   sheetTitle: { color: '#1f2937' },
   sheetClose: { color: '#6b7280' },
   searchContainer: { backgroundColor: 'rgba(0,0,0,0.06)' },
@@ -1001,16 +1547,27 @@ const stylesLight = StyleSheet.create({
   alphaText: { color: '#1f2937' },
   radioChip: { backgroundColor: '#e9ecf5', borderColor: 'transparent' },
   radioChipActive: { borderColor: '#2b6cb0' },
-  banner: { borderTopColor: 'rgba(0,0,0,0.12)' },
+  banner: { borderTopColor: 'rgba(0,0,0,0.12)', backgroundColor: '#fbf8ef' },
   bannerText: { color: '#6b7280' },
   loadingOverlay: { backgroundColor: 'rgba(0,0,0,0.8)' },
   loadingContent: { backgroundColor: 'rgba(255,255,255,0.95)' },
   loadingText: { color: '#1f2937' },
   loadingSubtext: { color: '#6b7280' },
+  // Victory screen overrides
+  victoryTitle: { color: '#2b6cb0' },
+  victorySubtitle: { color: '#6b7280' },
+  victoryGoalName: { color: '#2b6cb0' },
+  statsBox: { backgroundColor: 'rgba(43,108,176,0.08)', borderColor: 'rgba(43,108,176,0.25)' },
+  statsTitle: { color: '#2b6cb0' },
+  statsText: { color: '#1f2937' },
+  historyBox: { backgroundColor: 'rgba(0,0,0,0.05)', borderColor: 'rgba(0,0,0,0.1)' },
+  historyBoxTitle: { color: '#1f2937' },
+  victoryButton: { backgroundColor: '#2b6cb0' },
+  victoryButtonText: { color: '#ffffff' },
 });
 
 const homeStyles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: '#fbf8ef' },
+  container: { flex: 1, backgroundColor: '#fbf8ef', zIndex: 9 },
   headerSpace: { height: 0 },
   centerWrap: { flex: 1, alignItems: 'center', justifyContent: 'center', paddingHorizontal: 24 },
   brand: { fontSize: 36, fontWeight: '800', color: '#2a2a2a', letterSpacing: 2, marginBottom: 18, textTransform: 'uppercase' as any },
@@ -1020,8 +1577,8 @@ const homeStyles = StyleSheet.create({
   primaryBtn: { backgroundColor: '#2b6cb0', paddingVertical: 12, paddingHorizontal: 20, borderRadius: 12, alignSelf: 'stretch', alignItems: 'center' },
   primaryBtnText: { color: '#ffffff', fontWeight: '800', fontSize: 16 },
   menu: { width: '86%', maxWidth: 420, marginTop: 28 },
-  menuItem: { backgroundColor: '#ffffff', paddingVertical: 14, paddingHorizontal: 16, borderRadius: 12, marginBottom: 12, boxShadow: '0 4px 10px rgba(0, 0, 0, 0.04)', elevation: 1 },
-  menuText: { color: '#3a3a3a', fontSize: 16 }
+  menuItem: { paddingVertical: 14, paddingHorizontal: 16, marginBottom: 12, alignItems: 'center' },
+  menuText: { color: '#3a3a3a', fontSize: 16, fontWeight: '600' }
 });
 
 const homeStylesDark = StyleSheet.create({
@@ -1032,7 +1589,7 @@ const homeStylesDark = StyleSheet.create({
   cardNumber: { color: '#eef1ff' },
   primaryBtn: { backgroundColor: '#2b6cb0' },
   primaryBtnText: { color: '#ffffff' },
-  menuItem: { backgroundColor: '#151a33', boxShadow: '0 4px 10px rgba(0, 0, 0, 0.12)' },
+  menuItem: { },
   menuText: { color: '#eef1ff' },
 });
 
@@ -1044,6 +1601,6 @@ const homeStylesLight = StyleSheet.create({
   cardNumber: { color: '#1b1f2a' },
   primaryBtn: { backgroundColor: '#2b6cb0' },
   primaryBtnText: { color: '#ffffff' },
-  menuItem: { backgroundColor: '#ffffff' },
+  menuItem: { },
   menuText: { color: '#3a3a3a' },
 });
