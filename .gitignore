@@ -33,6 +33,8 @@ ai_service/__pycache__/
 *.vec.gz
 *.bin
 *.bin.gz
+*.zip
+.generated_keep_words.txt
 
 # Firebase
 .firebase/
