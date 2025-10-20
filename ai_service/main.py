@@ -657,8 +657,8 @@ def generate_daily_puzzle(req: DailyPuzzleRequest):
   goal_idx = int(rng() * len(goal_candidates))
   goal_word = goal_candidates[goal_idx].capitalize()
   
-  # Determine number of start words
-  num_starts = 2 if rng() < 0.5 else 3
+  # Determine number of start words (always 2 to match client)
+  num_starts = 2
   
   # Select start words (prefer common concrete words)
   start_candidates = [w for w in good_words[100:5000] if w != goal_word.lower()]

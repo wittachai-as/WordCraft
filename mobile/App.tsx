@@ -108,7 +108,7 @@ function pickDaily(dateISO: string) {
   const rnd = mulberry32(seedFromDateStr(dateISO));
   const pickName = (arr: string[]) => arr[Math.floor(rnd() * arr.length)];
   const goalName = pickName(GOAL_WORD_NAMES);
-  const k = rnd() < 0.5 ? 2 : 3;
+  const k = 2; // Always use 2 start words to match AI Service
   const pool = [...START_WORD_NAMES];
   const starts: string[] = [];
   for (let i = 0; i < k; i++) {
