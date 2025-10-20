@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { SafeAreaView, View, Text, StyleSheet, TouchableOpacity, FlatList, Alert, PanResponder, LayoutRectangle, Animated, Platform, useWindowDimensions, ScrollView, TextInput, useColorScheme } from 'react-native';
 // import { AdMobBanner } from 'expo-ads-admob'; // Disabled for web compatibility
+import { Ionicons, MaterialIcons, Feather } from '@expo/vector-icons';
 import { fetchPuzzleForDate, fetchGlobalRecipes, requestAIRecipe } from './firebase';
 import { getUsedCombos, addUsedCombo, comboKey, appendHistory, clearAllForPuzzle, getDiscoveredWords, setDiscoveredWords, DiscoveredWord, getHistory, PlayItem } from './storage/history';
 import { syncHistory } from './storage/syncHistory';
@@ -151,6 +152,10 @@ export default function App() {
   const [usedCombos, setUsedCombos] = useState<Set<string>>(new Set());
   const [historyItems, setHistoryItems] = useState<PlayItem[]>([]);
   const [isLoadingHistory, setIsLoadingHistory] = useState(false);
+  const [currentMonth, setCurrentMonth] = useState(new Date()); // For calendar navigation
+  // Calendar played/won dates tracking (for history screen)
+  const [playedDates, setPlayedDates] = useState<Set<string>>(new Set());
+  const [wonDates, setWonDates] = useState<Set<string>>(new Set());
   const usedWords = useMemo(() => {
     const out = new Set<string>();
     usedCombos.forEach(k => {
@@ -228,6 +233,53 @@ export default function App() {
       } catch {}
     })();
   }, [daily]);
+
+  // Load played and won dates for calendar (only when on history screen)
+  useEffect(() => {
+    if (screen !== 'history') return;
+    
+    (async () => {
+      const played = new Set<string>();
+      const won = new Set<string>();
+      const keys = await AsyncStorage.getAllKeys();
+      const historyKeys = keys.filter(k => k.startsWith('wc_history_'));
+      
+      for (const key of historyKeys) {
+        const dateISO = key.replace('wc_history_', '');
+        const history = await getHistory(dateISO);
+        if (history && history.length > 0) {
+          played.add(dateISO);
+          
+          // Check if player won (discovered the goal word)
+          const discovered = await getDiscoveredWords(dateISO);
+          // Load the goal for that date to check if it's in discovered
+          try {
+            const AI_SERVICE_URL = process.env.EXPO_PUBLIC_AI_SERVICE_URL || 'http://localhost:8099';
+            const response = await fetch(`${AI_SERVICE_URL}/daily_puzzle`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ date_iso: dateISO }),
+            });
+            
+            if (response.ok) {
+              const data = await response.json();
+              const goalId = data.goal.toLowerCase();
+              const hasGoal = discovered.some(d => d.id.toLowerCase() === goalId);
+              if (hasGoal) {
+                won.add(dateISO);
+              }
+            }
+          } catch (error) {
+            // If can't load puzzle, skip won check
+            console.warn('Could not check won status for', dateISO);
+          }
+        }
+      }
+      
+      setPlayedDates(played);
+      setWonDates(won);
+    })();
+  }, [screen]); // Reload when screen changes
 
   // drag ghost state
   const dragItemRef = useRef<WordItem | null>(null);
@@ -946,44 +998,269 @@ export default function App() {
   if (screen !== 'game') {
     const gameNo = getDailyNumber();
     if (screen === 'history') {
-      console.log('Rendering history screen, isLoadingHistory:', isLoadingHistory, 'historyItems.length:', historyItems.length);
-      console.log('History screen is being rendered!');
+      // Calendar grid view for selecting previous games
+      const today = new Date();
+      today.setHours(0, 0, 0, 0);
+      const epochDate = new Date('2025-01-01'); // Start date: January 1, 2025
+      epochDate.setHours(0, 0, 0, 0);
+      const todayISO = getTodayISO();
+      
+      // Generate calendar grid for current month
+      const generateCalendarGrid = () => {
+        const year = currentMonth.getFullYear();
+        const month = currentMonth.getMonth();
+        
+        // First day of the month
+        const firstDay = new Date(year, month, 1);
+        const startingDayOfWeek = firstDay.getDay(); // 0 = Sunday
+        
+        // Last day of the month
+        const lastDay = new Date(year, month + 1, 0);
+        const daysInMonth = lastDay.getDate();
+        
+        // Generate grid (6 rows x 7 columns = 42 cells)
+        const grid: (Date | null)[] = [];
+        
+        // Add empty cells before first day
+        for (let i = 0; i < startingDayOfWeek; i++) {
+          const prevDate = new Date(year, month, 1 - (startingDayOfWeek - i));
+          grid.push(prevDate);
+        }
+        
+        // Add days of current month
+        for (let day = 1; day <= daysInMonth; day++) {
+          grid.push(new Date(year, month, day));
+        }
+        
+        // Add empty cells after last day to complete the grid (max 42 cells for 6 rows)
+        while (grid.length < 42) {
+          const nextDate = new Date(year, month + 1, grid.length - startingDayOfWeek - daysInMonth + 1);
+          grid.push(nextDate);
+        }
+        
+        // Trim to exactly 42 cells (6 rows)
+        return grid.slice(0, 42);
+      };
+      
+      const calendarGrid = generateCalendarGrid();
+      const weekDays = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+      
+      const getDayNumber = (date: Date) => {
+        const days = Math.floor((date.getTime() - epochDate.getTime()) / 86400000);
+        return days + 1;
+      };
+      
+      const isInCurrentMonth = (date: Date) => {
+        return date.getMonth() === currentMonth.getMonth() && date.getFullYear() === currentMonth.getFullYear();
+      };
+      
+      const isPlayable = (date: Date) => {
+        return date >= epochDate && date <= today;
+      };
+      
+      const isToday = (date: Date) => {
+        return date.toISOString().slice(0, 10) === todayISO;
+      };
+      
+      const hasPlayed = (date: Date) => {
+        const iso = date.toISOString().slice(0, 10);
+        return playedDates.has(iso);
+      };
+      
+      const hasWon = (date: Date) => {
+        const iso = date.toISOString().slice(0, 10);
+        return wonDates.has(iso);
+      };
+      
+      const onSelectDate = async (date: Date) => {
+        if (!isPlayable(date)) return;
+        
+        const iso = date.toISOString().slice(0, 10);
+        setDateISO(iso);
+        setIsLoading(true);
+        
+        try {
+          const AI_SERVICE_URL = process.env.EXPO_PUBLIC_AI_SERVICE_URL || 'http://localhost:8099';
+          const response = await fetch(`${AI_SERVICE_URL}/daily_puzzle`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ date_iso: iso }),
+          });
+          
+          if (response.ok) {
+            const data = await response.json();
+            setDailyOverride({
+              goal: { id: data.goal.toLowerCase(), name: data.goal, type: 'goal' },
+              startWords: data.start_words.map((w: string) => ({ 
+                id: w.toLowerCase(), 
+                name: w, 
+                type: 'start' as const 
+              })),
+            });
+          }
+        } catch (error) {
+          console.error('[History] Failed to load puzzle for date:', iso, error);
+        }
+        
+        setIsLoading(false);
+        setScreen('game');
+      };
+      
+      const goToPreviousMonth = () => {
+        const prev = new Date(currentMonth);
+        prev.setMonth(prev.getMonth() - 1);
+        // Don't go before epoch month
+        const epochMonth = new Date(epochDate.getFullYear(), epochDate.getMonth(), 1);
+        if (prev >= epochMonth) {
+          setCurrentMonth(prev);
+        }
+      };
+      
+      const goToNextMonth = () => {
+        const next = new Date(currentMonth);
+        next.setMonth(next.getMonth() + 1);
+        // Don't go beyond current month
+        const todayMonth = new Date(today.getFullYear(), today.getMonth(), 1);
+        if (next <= todayMonth) {
+          setCurrentMonth(next);
+        }
+      };
+      
+      const canGoPrev = () => {
+        const prev = new Date(currentMonth);
+        prev.setMonth(prev.getMonth() - 1);
+        const epochMonth = new Date(epochDate.getFullYear(), epochDate.getMonth(), 1);
+        return prev >= epochMonth;
+      };
+      
+      const canGoNext = () => {
+        const next = new Date(currentMonth);
+        next.setMonth(next.getMonth() + 1);
+        const todayMonth = new Date(today.getFullYear(), today.getMonth(), 1);
+        return next <= todayMonth;
+      };
+      
+      const monthName = currentMonth.toLocaleDateString('en-US', { month: 'long', year: 'numeric' });
+      
       return (
         <SafeAreaView style={[styles.container, isDark ? stylesDark.container : stylesLight.container]}>
           <View style={[styles.header, isDark ? stylesDark.header : stylesLight.header]}>
             <View style={styles.headerRow}>
-              <TouchableOpacity style={styles.backBtn} onPress={() => setScreen('game')} hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}>
+              <TouchableOpacity style={styles.backBtn} onPress={() => setScreen('home')} hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}>
                 <Text style={[styles.backIcon, isDark ? stylesDark.backIcon : stylesLight.backIcon]} selectable={false}>‹</Text>
               </TouchableOpacity>
-              <Text style={[styles.title, isDark ? stylesDark.title : stylesLight.title]} selectable={false}>HISTORY</Text>
+              <Text style={[styles.calendarTitle, isDark ? stylesDark.calendarTitle : stylesLight.calendarTitle]} selectable={false}>Previous games</Text>
               <View style={styles.menuBtn} />
             </View>
           </View>
-          <ScrollView style={[styles.historyContent, isDark ? stylesDark.historyContent : stylesLight.historyContent]}>
-            {isLoadingHistory ? (
-              <View style={styles.historyLoadingContainer}>
-                <Text style={[styles.historyText, isDark ? stylesDark.historyText : stylesLight.historyText]}>
-                  🔄 Loading history...
-                </Text>
-              </View>
-            ) : historyItems.length === 0 ? (
-              <Text style={[styles.historyText, isDark ? stylesDark.historyText : stylesLight.historyText]}>
-                No combinations yet today.
+          
+          <ScrollView style={[styles.calendarScroll, isDark ? stylesDark.calendarScroll : stylesLight.calendarScroll]}>
+            {/* Month navigation */}
+            <View style={styles.monthNav}>
+              <TouchableOpacity 
+                onPress={goToPreviousMonth} 
+                style={styles.monthNavBtn}
+                disabled={!canGoPrev()}
+              >
+                <Ionicons 
+                  name="chevron-back" 
+                  size={28} 
+                  color={canGoPrev() 
+                    ? (isDark ? '#a8b0d4' : '#6b7280') 
+                    : (isDark ? '#3a4056' : '#d1d5db')} 
+                />
+              </TouchableOpacity>
+              <Text style={[styles.monthNavText, isDark ? stylesDark.monthNavText : stylesLight.monthNavText]}>
+                {monthName}
               </Text>
-            ) : (
-              <View style={styles.historyList}>
-                {historyItems.map((item, index) => (
-                  <View key={item.ts} style={[styles.historyItem, isDark ? stylesDark.historyItem : stylesLight.historyItem]}>
-                    <Text style={[styles.historyItemText, isDark ? stylesDark.historyItemText : stylesLight.historyItemText]}>
-                      {item.a} + {item.b} = {item.resultName || '?'}
+              <TouchableOpacity 
+                onPress={goToNextMonth} 
+                style={styles.monthNavBtn}
+                disabled={!canGoNext()}
+              >
+                <Ionicons 
+                  name="chevron-forward" 
+                  size={28} 
+                  color={canGoNext() 
+                    ? (isDark ? '#a8b0d4' : '#6b7280') 
+                    : (isDark ? '#3a4056' : '#d1d5db')} 
+                />
+              </TouchableOpacity>
+            </View>
+            
+            {/* Week day headers */}
+            <View style={styles.weekDaysRow}>
+              {weekDays.map((day) => (
+                <View key={day} style={styles.weekDayCell}>
+                  <Text style={[styles.weekDayText, isDark ? stylesDark.weekDayText : stylesLight.weekDayText]}>
+                    {day}
+                  </Text>
+                </View>
+              ))}
+            </View>
+            
+            {/* Calendar grid */}
+            <View style={styles.calendarGrid}>
+              {calendarGrid.map((date, index) => {
+                if (!date) return <View key={index} style={styles.calendarCell} />;
+                
+                const inMonth = isInCurrentMonth(date);
+                const playable = isPlayable(date);
+                const isTodayDate = isToday(date);
+                const hasPlayedDate = hasPlayed(date);
+                const hasWonDate = hasWon(date);
+                const dayNum = getDayNumber(date);
+                
+                // แสดงวันที่ทั้งหมด แต่วันนอกเดือนและวันที่ยังไม่ถึงจะจาง
+                return (
+                  <TouchableOpacity
+                    key={index}
+                    style={[
+                      styles.calendarCell,
+                      (!inMonth || !playable) && styles.calendarCellOutside,
+                      isTodayDate && playable && (isDark ? stylesDark.calendarCellToday : stylesLight.calendarCellToday)
+                    ]}
+                    onPress={() => playable ? onSelectDate(date) : null}
+                    disabled={!playable}
+                  >
+                    <Text style={[
+                      styles.calendarCellDay,
+                      (!inMonth || !playable) && styles.calendarCellDayOutside,
+                      isDark ? stylesDark.calendarCellDay : stylesLight.calendarCellDay
+                    ]}>
+                      {date.getDate()}
                     </Text>
-                    <Text style={[styles.historyItemTime, isDark ? stylesDark.historyItemTime : stylesLight.historyItemTime]}>
-                      {new Date(item.ts).toLocaleTimeString()}
-                    </Text>
-                  </View>
-                ))}
-              </View>
-            )}
+                    {playable && (
+                      <>
+                        <Text style={[
+                          styles.calendarCellGame,
+                          !inMonth && styles.calendarCellGameOutside,
+                          isDark ? stylesDark.calendarCellGame : stylesLight.calendarCellGame
+                        ]}>
+                          #{dayNum}
+                        </Text>
+                        {hasWonDate && (
+                          <Ionicons 
+                            name="checkmark" 
+                            size={20} 
+                            color="#10b981" 
+                            style={styles.calendarCellIcon}
+                          />
+                        )}
+                        {hasPlayedDate && !hasWonDate && (
+                          <Ionicons 
+                            name="pause" 
+                            size={20} 
+                            color="#f59e0b" 
+                            style={styles.calendarCellIcon}
+                          />
+                        )}
+                      </>
+                    )}
+                  </TouchableOpacity>
+                );
+              })}
+            </View>
           </ScrollView>
         </SafeAreaView>
       );
@@ -1120,12 +1397,15 @@ export default function App() {
               setScreen('history');
               console.log('Screen set to history');
             }}>
+              <Ionicons name="calendar-outline" size={20} color={isDark ? '#a8b0d4' : '#6b7280'} />
               <Text style={[homeStyles.menuText, isDark ? homeStylesDark.menuText : homeStylesLight.menuText]} selectable={false}>Previous games</Text>
             </TouchableOpacity>
             <TouchableOpacity style={[homeStyles.menuItem, isDark ? homeStylesDark.menuItem : homeStylesLight.menuItem]} onPress={() => setScreen('howto')}>
+              <Ionicons name="help-circle-outline" size={20} color={isDark ? '#a8b0d4' : '#6b7280'} />
               <Text style={[homeStyles.menuText, isDark ? homeStylesDark.menuText : homeStylesLight.menuText]} selectable={false}>How to play</Text>
             </TouchableOpacity>
             <TouchableOpacity style={[homeStyles.menuItem, isDark ? homeStylesDark.menuItem : homeStylesLight.menuItem]} onPress={() => setScreen('settings')}>
+              <Ionicons name="settings-outline" size={20} color={isDark ? '#a8b0d4' : '#6b7280'} />
               <Text style={[homeStyles.menuText, isDark ? homeStylesDark.menuText : homeStylesLight.menuText]} selectable={false}>Settings</Text>
             </TouchableOpacity>
           </View>
@@ -1431,6 +1711,23 @@ const styles = StyleSheet.create({
   historyItem: { backgroundColor: 'rgba(255,255,255,0.05)', padding: 12, marginBottom: 8, borderRadius: 8, borderWidth: 1, borderColor: 'rgba(255,255,255,0.1)' },
   historyItemText: { color: '#eef1ff', fontSize: 16, fontWeight: '600', marginBottom: 4 },
   historyItemTime: { color: '#a8b0d4', fontSize: 12 },
+  // Calendar grid styles
+  calendarTitle: { color: '#2a2a2a', fontSize: 20, fontWeight: '800' },
+  calendarScroll: { flex: 1 },
+  monthNav: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 20, paddingVertical: 16 },
+  monthNavBtn: { width: 44, height: 44, alignItems: 'center', justifyContent: 'center' },
+  monthNavText: { fontSize: 20, fontWeight: '700', color: '#2a2a2a' },
+  weekDaysRow: { flexDirection: 'row', paddingHorizontal: 12, marginBottom: 8, marginTop: 8 },
+  weekDayCell: { flex: 1, alignItems: 'center', paddingVertical: 12 },
+  weekDayText: { fontSize: 15, fontWeight: '700', color: '#6b7280' },
+  calendarGrid: { flexDirection: 'row', flexWrap: 'wrap', paddingHorizontal: 12, paddingBottom: 20, height: 'calc(-220px + 100vh)' as any },
+  calendarCell: { width: '14.285%', aspectRatio: 0.55, padding: 6, alignItems: 'center', justifyContent: 'flex-start', backgroundColor: 'rgba(0,0,0,0.02)', borderWidth: 1, borderColor: 'rgba(0,0,0,0.05)' },
+  calendarCellOutside: { opacity: 0.4, backgroundColor: 'rgba(0,0,0,0.01)' },
+  calendarCellDay: { fontSize: 18, fontWeight: '600', color: '#1f2937', marginBottom: 4 },
+  calendarCellDayOutside: { color: '#d1d5db', fontWeight: '400' },
+  calendarCellGame: { fontSize: 12, fontWeight: '700', color: '#1f2937', marginBottom: 6 },
+  calendarCellGameOutside: { color: '#d1d5db', fontWeight: '500' },
+  calendarCellIcon: { marginTop: 4 },
   // Persistent Inventory Dock styles
   inventoryDock: { padding: 16, paddingHorizontal: 12, borderTopLeftRadius: 0, borderTopRightRadius: 0, borderTopWidth: 0, borderTopColor: 'transparent', borderBottomWidth: 1, borderBottomColor: 'rgba(0,0,0,0.1)' },
   inventoryHeaderRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 },
@@ -1487,6 +1784,18 @@ const stylesDark = StyleSheet.create({
   historyItem: { backgroundColor: 'rgba(255,255,255,0.05)', borderColor: 'rgba(255,255,255,0.1)' },
   historyItemText: { color: '#eef1ff' },
   historyItemTime: { color: '#a8b0d4' },
+  // Calendar grid overrides
+  calendarTitle: { color: '#eef1ff' },
+  calendarScroll: { backgroundColor: '#0f1222' },
+  monthNavText: { color: '#eef1ff' },
+  weekDayText: { color: '#a8b0d4' },
+  calendarCell: { backgroundColor: 'rgba(255,255,255,0.03)', borderColor: 'rgba(255,255,255,0.08)' },
+  calendarCellOutside: { opacity: 0.4, backgroundColor: 'rgba(255,255,255,0.01)' },
+  calendarCellToday: { backgroundColor: 'rgba(122,255,178,0.08)', borderColor: 'rgba(122,255,178,0.25)' },
+  calendarCellDay: { color: '#eef1ff' },
+  calendarCellDayOutside: { color: '#4b5563', fontWeight: '400' },
+  calendarCellGame: { color: '#a8b0d4' },
+  calendarCellGameOutside: { color: '#4b5563', fontWeight: '500' },
   sheetTitle: { color: '#eef1ff' },
   sheetClose: { color: '#a8b0d4' },
   searchContainer: { backgroundColor: 'rgba(255,255,255,0.08)' },
@@ -1536,6 +1845,18 @@ const stylesLight = StyleSheet.create({
   historyItem: { backgroundColor: 'rgba(0,0,0,0.05)', borderColor: 'rgba(0,0,0,0.1)' },
   historyItemText: { color: '#1f2937' },
   historyItemTime: { color: '#6b7280' },
+  // Calendar grid overrides
+  calendarTitle: { color: '#2a2a2a' },
+  calendarScroll: { backgroundColor: '#fbf8ef' },
+  monthNavText: { color: '#2a2a2a' },
+  weekDayText: { color: '#6b7280' },
+  calendarCell: { backgroundColor: 'rgba(0,0,0,0.02)', borderColor: 'rgba(0,0,0,0.05)' },
+  calendarCellOutside: { opacity: 0.4, backgroundColor: 'rgba(0,0,0,0.01)' },
+  calendarCellToday: { backgroundColor: 'rgba(43,108,176,0.08)', borderColor: 'rgba(43,108,176,0.25)' },
+  calendarCellDay: { color: '#1f2937' },
+  calendarCellDayOutside: { color: '#d1d5db', fontWeight: '400' },
+  calendarCellGame: { color: '#1f2937' },
+  calendarCellGameOutside: { color: '#d1d5db', fontWeight: '500' },
   sheetTitle: { color: '#1f2937' },
   sheetClose: { color: '#6b7280' },
   searchContainer: { backgroundColor: 'rgba(0,0,0,0.06)' },
@@ -1577,7 +1898,7 @@ const homeStyles = StyleSheet.create({
   primaryBtn: { backgroundColor: '#2b6cb0', paddingVertical: 12, paddingHorizontal: 20, borderRadius: 12, alignSelf: 'stretch', alignItems: 'center' },
   primaryBtnText: { color: '#ffffff', fontWeight: '800', fontSize: 16 },
   menu: { width: '86%', maxWidth: 420, marginTop: 28 },
-  menuItem: { paddingVertical: 14, paddingHorizontal: 16, marginBottom: 12, alignItems: 'center' },
+  menuItem: { paddingVertical: 14, paddingHorizontal: 16, marginBottom: 12, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 10 },
   menuText: { color: '#3a3a3a', fontSize: 16, fontWeight: '600' }
 });
 
