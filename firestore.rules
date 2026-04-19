@@ -1,0 +1,23 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // Global recipes - อ่านได้ทุกคน เขียนได้ทุกคน (สำหรับ REST API)
+    match /global_recipes/{document=**} {
+      allow read: if true;
+      allow write: if true;  // เปิดให้เขียนได้เพื่อให้ REST API ทำงาน
+    }
+    
+    // Puzzles - อ่านได้ทุกคน เขียนจาก authenticated เท่านั้น
+    match /puzzles/{document=**} {
+      allow read: if true;
+      allow write: if request.auth != null;
+    }
+    
+    // User history - เขียนได้แค่ authenticated user
+    match /users/{userId}/history/{document=**} {
+      allow read, write: if request.auth != null && request.auth.uid == userId;
+    }
+  }
+}
+

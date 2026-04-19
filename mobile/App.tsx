@@ -20,16 +20,43 @@ async function getOrCreateGuestUser(): Promise<string> {
     if (!guestId) {
       guestId = generateGuestId();
       await AsyncStorage.setItem(GUEST_USER_KEY, guestId);
-      console.log('👤 [AUTH] Created new guest user:', guestId);
     } else {
-      console.log('👤 [AUTH] Loaded existing guest user:', guestId);
     }
     return guestId;
   } catch (error) {
-    console.error('❌ [AUTH] Error managing guest user:', error);
     const fallbackId = generateGuestId();
-    console.log('👤 [AUTH] Using fallback guest ID:', fallbackId);
     return fallbackId;
+  }
+}
+
+// Settings management
+const SETTINGS_KEY = 'app_settings';
+
+interface AppSettings {
+  colorMode: 'system' | 'light' | 'dark';
+}
+
+const DEFAULT_SETTINGS: AppSettings = {
+  colorMode: 'system',
+};
+
+async function loadSettings(): Promise<AppSettings> {
+  try {
+    const stored = await AsyncStorage.getItem(SETTINGS_KEY);
+    if (stored) {
+      return { ...DEFAULT_SETTINGS, ...JSON.parse(stored) };
+    }
+  } catch (error) {
+    console.error('Failed to load settings:', error);
+  }
+  return DEFAULT_SETTINGS;
+}
+
+async function saveSettings(settings: AppSettings): Promise<void> {
+  try {
+    await AsyncStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
+  } catch (error) {
+    console.error('Failed to save settings:', error);
   }
 }
 
@@ -122,7 +149,7 @@ function pickDaily(dateISO: string) {
 type Placed = { uid: number; id: string; name: string; type?: WordItem['type']; x: number; y: number; z: number };
 
 export default function App() {
-  const [screen, setScreen] = useState<'home' | 'game' | 'history' | 'howto' | 'settings' | 'victory'>('home');
+  const [screen, setScreen] = useState<'home' | 'game' | 'history' | 'calendar' | 'howto' | 'settings' | 'victory'>('home');
   const [menuOpen, setMenuOpen] = useState(false);
   const scheme = useColorScheme();
   const [colorMode, setColorMode] = useState<'system' | 'light' | 'dark'>('system');
@@ -156,6 +183,7 @@ export default function App() {
   // Calendar played/won dates tracking (for history screen)
   const [playedDates, setPlayedDates] = useState<Set<string>>(new Set());
   const [wonDates, setWonDates] = useState<Set<string>>(new Set());
+  const [isLoadingCalendar, setIsLoadingCalendar] = useState(false);
   const usedWords = useMemo(() => {
     const out = new Set<string>();
     usedCombos.forEach(k => {
@@ -169,24 +197,38 @@ export default function App() {
   const [zCounter, setZCounter] = useState(1);
   const canvasRef = useRef<View>(null);
   const canvasRect = useRef<LayoutRectangle | null>(null);
+  const settingsLoadedRef = useRef(false); // Flag to prevent saving before loading
 
   // Update discovered when daily changes
-  // Initialize guest user
+  // Initialize guest user and load settings
   useEffect(() => {
     (async () => {
-      console.log('🚀 [AUTH] Initializing guest user...');
       const guestId = await getOrCreateGuestUser();
       setGuestUserId(guestId);
-      console.log('✅ [AUTH] Guest user initialized in state:', guestId);
+      
+      // Load saved settings
+      const settings = await loadSettings();
+      setColorMode(settings.colorMode);
+      
+      // Mark settings as loaded after a short delay to ensure state is updated
+      setTimeout(() => {
+        settingsLoadedRef.current = true;
+      }, 100);
     })();
   }, []);
+
+  // Save settings when colorMode changes (but only after initial load)
+  useEffect(() => {
+    if (settingsLoadedRef.current) {
+      saveSettings({ colorMode });
+    }
+  }, [colorMode]);
 
   // 🧪 Test Firebase sync (TEMPORARY - for debugging)
   useEffect(() => {
     if (guestUserId) {
-      console.log('🧪 [TEST] Guest user ready, running sync test...');
       testSync(guestUserId).catch(err => {
-        console.error('🧪 [TEST] Test sync failed:', err);
+        // Silent fail for test sync
       });
     }
   }, [guestUserId]);
@@ -197,12 +239,27 @@ export default function App() {
       (async () => {
         try {
           setIsLoadingHistory(true);
-          console.log('Loading history for dateISO:', dateISO);
           const history = await getHistory(dateISO);
-          console.log('History loaded:', history);
           setHistoryItems(history);
+          
+          // If on victory screen, also load discovered words for accurate count
+          if (screen === 'victory') {
+            try {
+              const persistedDiscovered = await getDiscoveredWords(dateISO);
+              const allWords = [
+                ...daily.startWords,
+                ...persistedDiscovered.map(w => ({ id: w.id.toLowerCase(), name: w.name, type: 'result' as const }))
+              ];
+              // Remove duplicates
+              const unique = allWords.filter((word, index, self) => 
+                index === self.findIndex(w => w.id === word.id)
+              );
+              setDiscovered(unique);
+            } catch (error) {
+              // Keep existing discovered list
+            }
+          }
         } catch (error) {
-          console.error('Error loading history:', error);
           setHistoryItems([]);
         } finally {
           setIsLoadingHistory(false);
@@ -231,53 +288,112 @@ export default function App() {
         const used = await getUsedCombos(dateISO);
         setUsedCombos(used);
       } catch {}
+      
+      // Check if player has already won today
+      const hasGoalWord = merged.some(w => w.id.toLowerCase() === daily.goal.id.toLowerCase());
+      setHasWon(hasGoalWord);
     })();
-  }, [daily]);
+  }, [daily, dateISO]);
 
-  // Load played and won dates for calendar (only when on history screen)
+  // Navigate to victory screen if entering game while already won (only for current date)
   useEffect(() => {
-    if (screen !== 'history') return;
+    if (screen === 'game' && hasWon && dateISO === getTodayISO()) {
+      // Only redirect to victory if playing today's game and already won
+      setScreen('victory');
+    }
+  }, [screen, hasWon, dateISO]);
+
+  // Load played and won dates for calendar (only when on calendar screen)
+  useEffect(() => {
+    if (screen !== 'calendar') return;
     
     (async () => {
+      setIsLoadingCalendar(true);
       const played = new Set<string>();
       const won = new Set<string>();
       const keys = await AsyncStorage.getAllKeys();
       const historyKeys = keys.filter(k => k.startsWith('wc_history_'));
       
-      for (const key of historyKeys) {
+      // STEP 1: Load played dates quickly (synchronous from AsyncStorage)
+      const playedPromises = historyKeys.map(async (key) => {
         const dateISO = key.replace('wc_history_', '');
         const history = await getHistory(dateISO);
-        if (history && history.length > 0) {
-          played.add(dateISO);
-          
-          // Check if player won (discovered the goal word)
-          const discovered = await getDiscoveredWords(dateISO);
-          // Load the goal for that date to check if it's in discovered
-          try {
-            const AI_SERVICE_URL = process.env.EXPO_PUBLIC_AI_SERVICE_URL || 'http://localhost:8099';
-            const response = await fetch(`${AI_SERVICE_URL}/daily_puzzle`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ date_iso: dateISO }),
-            });
-            
-            if (response.ok) {
-              const data = await response.json();
-              const goalId = data.goal.toLowerCase();
-              const hasGoal = discovered.some(d => d.id.toLowerCase() === goalId);
-              if (hasGoal) {
-                won.add(dateISO);
-              }
-            }
-          } catch (error) {
-            // If can't load puzzle, skip won check
-            console.warn('Could not check won status for', dateISO);
-          }
+        return { dateISO, hasHistory: history && history.length > 0 };
+      });
+      
+      const playedResults = await Promise.all(playedPromises);
+      
+      for (const result of playedResults) {
+        if (result.hasHistory) {
+          played.add(result.dateISO);
         }
       }
       
-      setPlayedDates(played);
-      setWonDates(won);
+      // Update played dates immediately (fast feedback)
+      setPlayedDates(new Set(played));
+      setIsLoadingCalendar(false); // Played dates loaded
+      
+      // STEP 2: Check won status in background (parallel API calls)
+      const wonPromises = playedResults
+        .filter(r => r.hasHistory)
+        .map(async (result) => {
+          try {
+            // Check if player won by looking at discovered words
+            const discovered = await getDiscoveredWords(result.dateISO);
+            
+            // Try to get cached goal from AsyncStorage first
+            const cachedGoalKey = `wc_goal_${result.dateISO}`;
+            let goalId: string | null = null;
+            
+            try {
+              const cached = await AsyncStorage.getItem(cachedGoalKey);
+              if (cached) {
+                goalId = cached.toLowerCase();
+              }
+            } catch (e) {
+              // Cache miss, will fetch from API
+            }
+            
+            // If not cached, fetch from API
+            if (!goalId) {
+              const AI_SERVICE_URL = process.env.EXPO_PUBLIC_AI_SERVICE_URL || 'http://localhost:8099';
+              const response = await fetch(`${AI_SERVICE_URL}/daily_puzzle`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ date: result.dateISO }),
+              });
+              
+              if (response.ok) {
+                const data = await response.json();
+                if (data.goalWord) {
+                  const goalWordLower = data.goalWord.toLowerCase();
+                  goalId = goalWordLower;
+                  // Cache for next time
+                  await AsyncStorage.setItem(cachedGoalKey, goalWordLower);
+                }
+              }
+            }
+            
+            // Check if goal is in discovered words
+            if (goalId) {
+              const hasGoal = discovered.some(d => d.id.toLowerCase() === goalId);
+              return { dateISO: result.dateISO, won: hasGoal };
+            }
+          } catch (error) {
+            // Skip won check on error
+          }
+          return { dateISO: result.dateISO, won: false };
+        });
+      
+      // Update won dates as they come in (progressive loading)
+      const wonResults = await Promise.all(wonPromises);
+      for (const result of wonResults) {
+        if (result.won) {
+          won.add(result.dateISO);
+        }
+      }
+      
+      setWonDates(new Set(won));
     })();
   }, [screen]); // Reload when screen changes
 
@@ -446,11 +562,11 @@ export default function App() {
     let cancelled = false;
     async function loadRemote() {
       try {
-        // Show loading screen
+        // Show loading screen and reset dailyOverride
         setIsLoading(true);
+        setDailyOverride(null); // Reset to force loading screen
         
         // Load puzzle from AI Service (Word2Vec vocabulary)
-        console.log('🎲 Loading puzzle from AI Service for date:', dateISO);
         const AI_SERVICE_URL = process.env.EXPO_PUBLIC_AI_SERVICE_URL || 'http://127.0.0.1:8099';
         
         try {
@@ -462,21 +578,42 @@ export default function App() {
           
           if (puzzleResponse.ok) {
             const puzzleData = await puzzleResponse.json();
-            const goal = toItem(puzzleData.goalWord, 'goal');
-            const startWords = puzzleData.startWords.map((n: string) => toItem(n, 'start'));
-            console.log('✅ Generated puzzle from Word2Vec:', { 
-              goal: puzzleData.goalWord, 
-              starts: puzzleData.startWords,
-              vocab_size: puzzleData.vocab_size 
-            });
-            setDailyOverride({ goal, startWords });
+            
+            // Check puzzle version - only use puzzles with validation (v2.0+)
+            const puzzleVersion = puzzleData.version || "1.0";
+            
+            if (parseFloat(puzzleVersion) < 2.0) {
+              console.log(`[PUZZLE] ⚠️  Old puzzle version ${puzzleVersion} for ${dateISO}, skipping...`);
+              
+              // Clear old cached goal if exists
+              try {
+                await AsyncStorage.removeItem(`wc_goal_${dateISO}`);
+              } catch (e) {
+                // Ignore error
+              }
+              
+              // Use local fallback and let server regenerate next time
+              // Old puzzles in Firestore will eventually be replaced by v2.0
+              const localPuzzle = pickDaily(dateISO);
+              setDailyOverride(localPuzzle);
+            } else {
+              const goal = toItem(puzzleData.goalWord, 'goal');
+              const startWords = puzzleData.startWords.map((n: string) => toItem(n, 'start'));
+              setDailyOverride({ goal, startWords });
+              console.log(`[PUZZLE] ✅ Loaded puzzle v${puzzleVersion} for ${dateISO}`);
+              
+              // Cache the goal for future use (calendar won status)
+              try {
+                await AsyncStorage.setItem(`wc_goal_${dateISO}`, puzzleData.goalWord.toLowerCase());
+              } catch (e) {
+                // Ignore cache error
+              }
+            }
           } else {
-            console.log('⚠️ AI Service unavailable, using local fallback');
             const localPuzzle = pickDaily(dateISO);
             setDailyOverride(localPuzzle);
           }
         } catch (aiError) {
-          console.log('⚠️ Cannot connect to AI Service, using local fallback');
           const localPuzzle = pickDaily(dateISO);
           setDailyOverride(localPuzzle);
         }
@@ -491,7 +628,6 @@ export default function App() {
           try { fbConfig = require('./firebase.config.json'); } catch (e) { fbConfig = undefined; }
           
           if (!fbConfig) {
-            console.log('⚠️ No Firebase config, AI will generate on-the-fly');
             setRecipesOverride(null);
             return;
           }
@@ -508,19 +644,15 @@ export default function App() {
                 const r = globalRecipes[k];
                 mapped[k.toLowerCase()] = { id: r.id || slugify(r.name), name: r.name || '', type: r.type ?? 'result' } as WordItem;
               }
-              console.log('✅ Loaded', Object.keys(mapped).length, 'global recipes from Firestore');
               setRecipesOverride(mapped);
             } else {
-              console.log('⚠️ No global recipes found in Firestore, AI will generate on-the-fly');
               setRecipesOverride(null);
             }
           } catch (err) {
-            console.log('⚠️ Failed to load Firestore recipes, using AI generation');
             setRecipesOverride(null);
           }
         })();
       } catch (e) {
-        console.error('❌ Error loading data:', e);
         // Still use local fallback if everything fails
         const localPuzzle = pickDaily(dateISO);
         setDailyOverride(localPuzzle);
@@ -534,14 +666,12 @@ export default function App() {
 
   // Force reload on app start to ensure fresh data
   useEffect(() => {
-    console.log('🚀 App started, forcing fresh data load...');
     setForceReload(prev => prev + 1);
   }, []);
 
   // Force reload when screen becomes active (for web refresh)
   useEffect(() => {
     const handleFocus = () => {
-      console.log('🔄 Screen focused, forcing data reload...');
       setForceReload(prev => prev + 1);
     };
     
@@ -555,7 +685,6 @@ export default function App() {
   // Auto-hide loading screen when dailyOverride is set (prevent flickering)
   useEffect(() => {
     if (dailyOverride && isLoading) {
-      console.log('✅ Daily puzzle loaded, hiding loading screen');
       setIsLoading(false);
     }
   }, [dailyOverride, isLoading]);
@@ -655,24 +784,50 @@ export default function App() {
         try { fbConfig = require('./firebase.config.json'); } catch (e) { fbConfig = undefined; }
         // Call AI service - use environment variable or fallback
         const AI_SERVICE_URL = process.env.EXPO_PUBLIC_AI_SERVICE_URL || 'http://127.0.0.1:8099';
-        const ai = await fetch(`${AI_SERVICE_URL}/combine`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ a: currentA, b: currentB })
-        }).then(res => res.ok ? res.json() : null);
-        if (ai) result = { id: ai.id, name: ai.name, type: ai.type } as WordItem;
+        try {
+          const response = await fetch(`${AI_SERVICE_URL}/combine`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ a: currentA, b: currentB, goal: daily.goal.name })
+          });
+          if (response.ok) {
+            const ai = await response.json();
+            if (ai && ai.id) {
+              result = { id: ai.id, name: ai.name, type: ai.type } as WordItem;
+            }
+          }
+        } catch (fetchError) {
+          console.error('AI Service error:', fetchError);
+        }
       }
       const ts = Date.now();
       if (result) {
         ensureInDiscovered(result);
-        Alert.alert('Result', `${result.name}`);
-        setLastResult(result.name);
-        console.log('Saving history:', { a: currentA, b: currentB, resultId: result.id, resultName: result.name, ts, puzzleId: dateISO });
-        await appendHistory(dateISO, { a: currentA, b: currentB, resultId: result.id, resultName: result.name, ts, puzzleId: dateISO, synced: false });
-        // persist discovered list
-        try {
-          await setDiscoveredWords(dateISO, [{ id: result.id, name: result.name }, ...discovered.map(d => ({ id: d.id, name: d.name }))]);
-        } catch {}
+        
+        // Check if result is the goal word
+        const isGoal = result.id.toLowerCase() === daily.goal.id.toLowerCase();
+        
+        if (isGoal) {
+          // Found the goal! Show victory screen
+          setHasWon(true);
+          setLastResult(result.name);
+          await appendHistory(dateISO, { a: currentA, b: currentB, resultId: result.id, resultName: result.name, ts, puzzleId: dateISO, synced: false });
+          // persist discovered list
+          try {
+            await setDiscoveredWords(dateISO, [{ id: result.id, name: result.name }, ...discovered.map(d => ({ id: d.id, name: d.name }))]);
+          } catch {}
+          // Navigate to victory screen
+          setScreen('victory');
+        } else {
+          // Normal result
+          Alert.alert('Result', `${result.name}`);
+          setLastResult(result.name);
+          await appendHistory(dateISO, { a: currentA, b: currentB, resultId: result.id, resultName: result.name, ts, puzzleId: dateISO, synced: false });
+          // persist discovered list
+          try {
+            await setDiscoveredWords(dateISO, [{ id: result.id, name: result.name }, ...discovered.map(d => ({ id: d.id, name: d.name }))]);
+          } catch {}
+        }
       } else {
         // Shake animation for failed combination
         Animated.sequence([
@@ -684,7 +839,6 @@ export default function App() {
         ]).start();
         
         setLastResult('❌ No Connection');
-        console.log('Saving history (no result):', { a: currentA, b: currentB, ts, puzzleId: dateISO });
         await appendHistory(dateISO, { a: currentA, b: currentB, ts, puzzleId: dateISO, synced: false });
       }
       await addUsedCombo(dateISO, currentA, currentB);
@@ -693,13 +847,10 @@ export default function App() {
       setCurrentA(null);
       setCurrentB(null);
       // background sync
-      console.log('🔄 Attempting to sync history, guestUserId:', guestUserId);
       if (guestUserId) {
         syncHistory(dateISO, guestUserId).catch((error) => {
-          console.error('❌ Failed to sync history:', error);
+          // Silent fail for background sync
         });
-      } else {
-        console.warn('⚠️  Guest user ID not available, skipping sync');
       }
     } catch (e) {
       Alert.alert('Error', 'เกิดข้อผิดพลาดขณะผสม');
@@ -731,7 +882,7 @@ export default function App() {
               const ai = await fetch(`${AI_SERVICE_URL}/combine`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ a: a.id, b: b.id })
+                body: JSON.stringify({ a: a.id, b: b.id, goal: daily.goal.name })
               }).then(res => res.ok ? res.json() : null);
               if (!ai) return;
               const cxAI = (a.x + b.x) / 2; const cyAI = (a.y + b.y) / 2;
@@ -756,20 +907,16 @@ export default function App() {
         next.push({ uid, id: result.id, name: result.name, type: result.type, x: cx, y: cy, z: 99 });
         ensureInDiscovered(result);
         if (result.id === daily.goal.id) {
-          console.log('🎉 Victory! Goal achieved:', daily.goal.name);
           setHasWon(true);
           // Save victory history to Firebase
           setTimeout(async () => {
             try {
               const victoryHistory = await getHistory(dateISO);
-              console.log('💾 Saving victory history to Firebase:', victoryHistory.length, 'plays');
               if (guestUserId && victoryHistory.length > 0) {
                 await syncHistory(dateISO, guestUserId);
-                console.log('✅ Victory history saved!');
               }
               setScreen('victory');
             } catch (error) {
-              console.error('❌ Failed to save victory history:', error);
               setScreen('victory'); // Go to victory screen anyway
             }
           }, 500);
@@ -803,7 +950,7 @@ export default function App() {
               const ai = await fetch(`${AI_SERVICE_URL}/combine`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ a: dragItem.id, b: b.id })
+                body: JSON.stringify({ a: dragItem.id, b: b.id, goal: daily.goal.name })
               }).then(res => res.ok ? res.json() : null);
               if (!ai) return;
               const cxAI = (x + b.x) / 2; const cyAI = (y + b.y) / 2;
@@ -824,20 +971,16 @@ export default function App() {
         next.push({ uid, id: result.id, name: result.name, type: result.type, x: cx, y: cy, z: 1 });
         ensureInDiscovered(result);
         if (result.id === daily.goal.id) {
-          console.log('🎉 Victory! Goal achieved:', daily.goal.name);
           setHasWon(true);
           // Save victory history to Firebase
           setTimeout(async () => {
             try {
               const victoryHistory = await getHistory(dateISO);
-              console.log('💾 Saving victory history to Firebase:', victoryHistory.length, 'plays');
               if (guestUserId && victoryHistory.length > 0) {
                 await syncHistory(dateISO, guestUserId);
-                console.log('✅ Victory history saved!');
               }
               setScreen('victory');
             } catch (error) {
-              console.error('❌ Failed to save victory history:', error);
               setScreen('victory'); // Go to victory screen anyway
             }
           }, 500);
@@ -997,7 +1140,7 @@ export default function App() {
   // Home Screen rendering
   if (screen !== 'game') {
     const gameNo = getDailyNumber();
-    if (screen === 'history') {
+    if (screen === 'calendar') {
       // Calendar grid view for selecting previous games
       const today = new Date();
       today.setHours(0, 0, 0, 0);
@@ -1046,7 +1189,9 @@ export default function App() {
       const weekDays = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
       
       const getDayNumber = (date: Date) => {
-        const days = Math.floor((date.getTime() - epochDate.getTime()) / 86400000);
+        const normalizedDate = new Date(date);
+        normalizedDate.setHours(0, 0, 0, 0);
+        const days = Math.floor((normalizedDate.getTime() - epochDate.getTime()) / 86400000);
         return days + 1;
       };
       
@@ -1055,7 +1200,8 @@ export default function App() {
       };
       
       const isPlayable = (date: Date) => {
-        return date >= epochDate && date <= today;
+        // Previous games should only show past dates, not today
+        return date >= epochDate && date < today;
       };
       
       const isToday = (date: Date) => {
@@ -1075,35 +1221,20 @@ export default function App() {
       const onSelectDate = async (date: Date) => {
         if (!isPlayable(date)) return;
         
-        const iso = date.toISOString().slice(0, 10);
-        setDateISO(iso);
-        setIsLoading(true);
+        // Set the selected date and check if player has won that day
+        const selectedDateISO = date.toISOString().slice(0, 10);
+        setDateISO(selectedDateISO);
         
-        try {
-          const AI_SERVICE_URL = process.env.EXPO_PUBLIC_AI_SERVICE_URL || 'http://localhost:8099';
-          const response = await fetch(`${AI_SERVICE_URL}/daily_puzzle`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ date_iso: iso }),
-          });
-          
-          if (response.ok) {
-            const data = await response.json();
-            setDailyOverride({
-              goal: { id: data.goal.toLowerCase(), name: data.goal, type: 'goal' },
-              startWords: data.start_words.map((w: string) => ({ 
-                id: w.toLowerCase(), 
-                name: w, 
-                type: 'start' as const 
-              })),
-            });
-          }
-        } catch (error) {
-          console.error('[History] Failed to load puzzle for date:', iso, error);
+        // Check if player won on that date
+        const hasWonThatDay = hasWon(date);
+        
+        if (hasWonThatDay) {
+          // If already won, go to victory screen
+          setScreen('victory');
+        } else {
+          // If not won yet, go to game screen
+          setScreen('game');
         }
-        
-        setIsLoading(false);
-        setScreen('game');
       };
       
       const goToPreviousMonth = () => {
@@ -1265,6 +1396,54 @@ export default function App() {
         </SafeAreaView>
       );
     }
+    if (screen === 'history') {
+      return (
+        <SafeAreaView style={[styles.container, isDark ? stylesDark.container : stylesLight.container]}>
+          <View style={[styles.header, isDark ? stylesDark.header : stylesLight.header]}>
+            <View style={styles.headerRow}>
+              <TouchableOpacity style={styles.backBtn} onPress={() => setScreen('game')} hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}>
+                <Text style={[styles.backIcon, isDark ? stylesDark.backIcon : stylesLight.backIcon]} selectable={false}>‹</Text>
+              </TouchableOpacity>
+              <Text style={[styles.title, isDark ? stylesDark.title : stylesLight.title]} selectable={false}>History</Text>
+              <View style={styles.menuBtn} />
+            </View>
+          </View>
+          <ScrollView style={[styles.historyContent, isDark ? stylesDark.historyContent : stylesLight.historyContent]}>
+            <View style={styles.historyContainer}>
+              <Text style={[styles.historyTitle, isDark ? stylesDark.historyTitle : stylesLight.historyTitle]}>
+                Today's Combinations
+              </Text>
+              <Text style={[styles.historySubtitle, isDark ? stylesDark.historySubtitle : stylesLight.historySubtitle]}>
+                {dateISO}
+              </Text>
+              
+              {isLoadingHistory ? (
+                <Text style={[styles.historyText, isDark ? stylesDark.historyText : stylesLight.historyText]}>
+                  Loading...
+                </Text>
+              ) : historyItems.length === 0 ? (
+                <Text style={[styles.historyText, isDark ? stylesDark.historyText : stylesLight.historyText]}>
+                  No combinations recorded yet.
+                </Text>
+              ) : (
+                <View style={styles.historyList}>
+                  {historyItems.map((item, index) => (
+                    <View key={item.ts} style={[styles.historyItem, isDark ? stylesDark.historyItem : stylesLight.historyItem]}>
+                      <Text style={[styles.historyItemText, isDark ? stylesDark.historyItemText : stylesLight.historyItemText]}>
+                        {item.a} + {item.b} = {item.resultName || '?'}
+                      </Text>
+                      <Text style={[styles.historyItemTime, isDark ? stylesDark.historyItemTime : stylesLight.historyItemTime]}>
+                        {new Date(item.ts).toLocaleTimeString()}
+                      </Text>
+                    </View>
+                  ))}
+                </View>
+              )}
+            </View>
+          </ScrollView>
+        </SafeAreaView>
+      );
+    }
     if (screen === 'victory') {
       return (
         <SafeAreaView style={[styles.container, isDark ? stylesDark.container : stylesLight.container]}>
@@ -1311,7 +1490,11 @@ export default function App() {
                     No combinations recorded.
                   </Text>
                 ) : (
-                  <View style={styles.historyList}>
+                  <ScrollView 
+                    style={styles.historyList}
+                    showsVerticalScrollIndicator={true}
+                    nestedScrollEnabled={true}
+                  >
                     {historyItems.map((item, index) => (
                       <View key={item.ts} style={[styles.historyItem, isDark ? stylesDark.historyItem : stylesLight.historyItem]}>
                         <Text style={[styles.historyItemText, isDark ? stylesDark.historyItemText : stylesLight.historyItemText]}>
@@ -1322,7 +1505,7 @@ export default function App() {
                         </Text>
                       </View>
                     ))}
-                  </View>
+                  </ScrollView>
                 )}
               </View>
 
@@ -1385,17 +1568,26 @@ export default function App() {
           <View style={[homeStyles.card, isDark ? homeStylesDark.card : homeStylesLight.card]}>
             <Text style={[homeStyles.cardLabel, isDark ? homeStylesDark.cardLabel : homeStylesLight.cardLabel]} selectable={false}>Today's game:</Text>
             <Text style={[homeStyles.cardNumber, isDark ? homeStylesDark.cardNumber : homeStylesLight.cardNumber]} selectable={false}>#{gameNo}</Text>
-            <TouchableOpacity style={[homeStyles.primaryBtn, isDark ? homeStylesDark.primaryBtn : homeStylesLight.primaryBtn]} onPress={() => setScreen('game')}>
-              <Text style={[homeStyles.primaryBtnText, isDark ? homeStylesDark.primaryBtnText : homeStylesLight.primaryBtnText]} selectable={false}>{buttonText}</Text>
+            <TouchableOpacity 
+              style={[homeStyles.primaryBtn, isDark ? homeStylesDark.primaryBtn : homeStylesLight.primaryBtn]} 
+              onPress={() => {
+                // If already won, go to victory screen instead of game
+                if (hasWon) {
+                  setScreen('victory');
+                } else {
+                  setScreen('game');
+                }
+              }}
+            >
+              <Text style={[homeStyles.primaryBtnText, isDark ? homeStylesDark.primaryBtnText : homeStylesLight.primaryBtnText]} selectable={false}>
+                {hasWon ? 'View Results' : buttonText}
+              </Text>
             </TouchableOpacity>
           </View>
 
           <View style={homeStyles.menu}>
             <TouchableOpacity style={[homeStyles.menuItem, isDark ? homeStylesDark.menuItem : homeStylesLight.menuItem]} onPress={() => {
-              console.log('Home History button pressed, current dateISO:', dateISO);
-              console.log('Setting screen to history...');
-              setScreen('history');
-              console.log('Screen set to history');
+              setScreen('calendar');
             }}>
               <Ionicons name="calendar-outline" size={20} color={isDark ? '#a8b0d4' : '#6b7280'} />
               <Text style={[homeStyles.menuText, isDark ? homeStylesDark.menuText : homeStylesLight.menuText]} selectable={false}>Previous games</Text>
@@ -1422,10 +1614,10 @@ export default function App() {
         <View style={[styles.loadingOverlay, isDark ? stylesDark.loadingOverlay : stylesLight.loadingOverlay]}>
           <View style={[styles.loadingContent, isDark ? stylesDark.loadingContent : stylesLight.loadingContent]}>
             <Text style={[styles.loadingText, isDark ? stylesDark.loadingText : stylesLight.loadingText]}>
-              🔄 Loading...
+              🔄 กำลังโหลดโจทย์...
             </Text>
             <Text style={[styles.loadingSubtext, isDark ? stylesDark.loadingSubtext : stylesLight.loadingSubtext]}>
-              Fetching puzzle and recipes from Firestore
+              กำลังสร้างโจทย์ที่ผ่านการ validate
             </Text>
           </View>
         </View>
@@ -1458,7 +1650,6 @@ export default function App() {
               <Text style={[styles.menuItemText, isDark ? stylesDark.menuItemText : stylesLight.menuItemText]} selectable={false}>Give up</Text>
             </TouchableOpacity>
             <TouchableOpacity style={styles.menuItemRow} onPress={() => {
-              console.log('Game menu History button pressed, current dateISO:', dateISO);
               setMenuOpen(false);
               setScreen('history');
             }}>
@@ -1706,7 +1897,7 @@ const styles = StyleSheet.create({
   resultPlaceholderText: { color: 'rgba(0,0,0,0.45)' },
   historyText: { color: '#a8b0d4', fontSize: 16, textAlign: 'center', marginTop: 40, paddingHorizontal: 24 },
   historyContent: { flex: 1, flexDirection: 'column' },
-  historyList: { padding: 16 },
+  historyList: { padding: 16, maxHeight: 450 },
   historyLoadingContainer: { flex: 1, justifyContent: 'center', alignItems: 'center', paddingTop: 40 },
   historyItem: { backgroundColor: 'rgba(255,255,255,0.05)', padding: 12, marginBottom: 8, borderRadius: 8, borderWidth: 1, borderColor: 'rgba(255,255,255,0.1)' },
   historyItemText: { color: '#eef1ff', fontSize: 16, fontWeight: '600', marginBottom: 4 },
@@ -1758,10 +1949,13 @@ const styles = StyleSheet.create({
   statsBox: { width: '100%', backgroundColor: 'rgba(122,255,178,0.08)', padding: 20, borderRadius: 16, borderWidth: 1, borderColor: 'rgba(122,255,178,0.25)', marginBottom: 20 },
   statsTitle: { fontSize: 18, fontWeight: '700', color: '#7affb2', marginBottom: 12, textAlign: 'center' },
   statsText: { fontSize: 16, color: '#eef1ff', marginBottom: 6, textAlign: 'center' },
-  historyBox: { width: '100%', backgroundColor: 'rgba(255,255,255,0.05)', padding: 16, borderRadius: 16, borderWidth: 1, borderColor: 'rgba(255,255,255,0.1)', marginBottom: 20, maxHeight: 400 },
+  historyBox: { width: '100%', backgroundColor: 'rgba(255,255,255,0.05)', padding: 16, borderRadius: 16, borderWidth: 1, borderColor: 'rgba(255,255,255,0.1)', marginBottom: 20, maxHeight: 550 },
   historyBoxTitle: { fontSize: 18, fontWeight: '700', color: '#eef1ff', marginBottom: 12, textAlign: 'center' },
   victoryButton: { width: '100%', backgroundColor: '#7affb2', paddingVertical: 16, borderRadius: 12, alignItems: 'center', marginTop: 10 },
-  victoryButtonText: { color: '#0f1222', fontSize: 18, fontWeight: '800', textTransform: 'uppercase' as any }
+  victoryButtonText: { color: '#0f1222', fontSize: 18, fontWeight: '800', textTransform: 'uppercase' as any },
+  historyContainer: { padding: 20 },
+  historyTitle: { fontSize: 24, fontWeight: '800', marginBottom: 8, textAlign: 'center', color: '#2a2a2a' },
+  historySubtitle: { fontSize: 16, fontWeight: '600', marginBottom: 24, textAlign: 'center', opacity: 0.7, color: '#2a2a2a' },
 });
 
 // Light/Dark overrides
@@ -1824,6 +2018,8 @@ const stylesDark = StyleSheet.create({
   historyBoxTitle: { color: '#eef1ff' },
   victoryButton: { backgroundColor: '#7affb2' },
   victoryButtonText: { color: '#0f1222' },
+  historyTitle: { color: '#eef1ff' },
+  historySubtitle: { color: '#eef1ff' },
 });
 
 const stylesLight = StyleSheet.create({
@@ -1885,6 +2081,8 @@ const stylesLight = StyleSheet.create({
   historyBoxTitle: { color: '#1f2937' },
   victoryButton: { backgroundColor: '#2b6cb0' },
   victoryButtonText: { color: '#ffffff' },
+  historyTitle: { color: '#2a2a2a' },
+  historySubtitle: { color: '#2a2a2a' },
 });
 
 const homeStyles = StyleSheet.create({

@@ -1,5 +1,5 @@
 import { getFirestore, collection, writeBatch, doc, serverTimestamp, query, where, getDocs } from 'firebase/firestore';
-import { getApp } from 'firebase/app';
+import { ensureFirebaseApp } from '../firebase';
 // import { getAuth } from 'firebase/auth'; // Temporarily disabled due to API key issues
 import { listPending, markSynced, PlayItem } from './history';
 
@@ -13,16 +13,21 @@ import { listPending, markSynced, PlayItem } from './history';
  */
 export async function syncHistory(puzzleId: string, guestUserId?: string): Promise<void> {
   try {
-    console.log(`[SYNC] Starting sync for puzzle ${puzzleId}, user: ${guestUserId || 'anonymous'}`);
-    const app = getApp();
+    // Try to get Firebase config
+    let fbConfig: any = undefined;
+    try { fbConfig = require('../firebase.config.json'); } catch (e) { fbConfig = undefined; }
+    
+    const app = ensureFirebaseApp(fbConfig);
+    if (!app) {
+      return;
+    }
+    
     const db = getFirestore(app);
     // const auth = getAuth(app); // Temporarily disabled
     const uid = guestUserId ?? 'anonymous'; // Use guest user ID directly
 
     const pending = await listPending(puzzleId);
-    console.log(`[SYNC] Found ${pending.length} pending plays to sync`);
     if (pending.length === 0) {
-      console.log('[SYNC] No pending plays, skipping sync');
       return;
     }
 
@@ -49,7 +54,6 @@ export async function syncHistory(puzzleId: string, guestUserId?: string): Promi
       // Check if this exact play already exists
       const playKey = `${p.a}|${p.b}|${p.resultId || 'null'}`;
       if (existingPlays.has(playKey)) {
-        console.log('Skipping duplicate play:', playKey);
         tsSynced.push(p.ts); // Mark as synced even though we skipped
         continue;
       }
@@ -71,16 +75,10 @@ export async function syncHistory(puzzleId: string, guestUserId?: string): Promi
     }
 
     if (tsSynced.length > 0) {
-      console.log(`[SYNC] Committing batch with ${tsSynced.length} plays...`);
       await batch.commit();
       await markSynced(puzzleId, tsSynced);
-      console.log(`✅ [SYNC] Successfully synced ${tsSynced.length} plays for user ${uid}, puzzle ${puzzleId}`);
-      console.log(`📍 [SYNC] Plays saved to: users/${uid}/plays/`);
-    } else {
-      console.log('[SYNC] All plays were duplicates, nothing to sync');
     }
   } catch (error) {
-    console.error('❌ [SYNC] Error syncing history:', error);
     // Silently fail - don't break the app if sync fails
     throw error; // Re-throw to be caught by caller's catch block
   }
